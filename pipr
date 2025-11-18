@@ -316,7 +316,7 @@ if [[ $FORCE_ENCODING -eq 1 ]]; then
   fi
 fi
 
-log "[pipr] Attempting to stream using codec copy (-c copy)..."
+log "[pipr] Streaming using codec copy (-c copy)..."
 if run_ffmpeg_copy; then
   log "[pipr] Stream succeeded with stream copy."
   exit 0
