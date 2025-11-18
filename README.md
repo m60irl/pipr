@@ -96,6 +96,29 @@ Notes on precedence
 - Copy-first: Without `--force-encoding`, the tool tries `-c copy` first. If copy fails, it re-encodes using your flags.
 - If both `--keyframe-interval` and `--gop` are provided, `--keyframe-interval` takes precedence.
 
+## Production defaults
+
+To enhance resilience and compatibility for production streaming, pipr applies several defaults automatically:
+
+- **Conditional throttling**: The `-re` flag (real-time playback) is applied only to non-HTTP inputs (files, local streams) to throttle reading. For HTTP/HTTPS inputs, `-re` is not used to avoid adding latency to live streams.
+
+- **Network resilience for HTTP(S) inputs**: HTTP and HTTPS inputs automatically include:
+  - `-rw_timeout 15000000` (15 seconds in microseconds) to prevent infinite stalls on network issues
+  - `-http_persistent 0` to work better with flaky CDNs that don't handle persistent connections well
+  - Standard reconnect flags: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5`
+
+- **RTMP/FLV compatibility defaults**: When re-encoding (either forced or as fallback), pipr automatically adds:
+  - `-pix_fmt yuv420p` for broad decoder compatibility
+  - `-ac 2` for stereo audio output
+  - When `--bitrate` is specified, also adds `-maxrate` and `-bufsize` (both set to the same value) to stabilize rate control
+
+- **Keyframe and framerate alignment**: When using `--keyframe-interval` with seconds (e.g., `2s`) AND `--fps` is provided:
+  - Output framerate is set with `-r <fps>`
+  - Constant framerate mode is enforced with `-vsync cfr`
+  - GOP size `-g` is computed as `round(seconds * fps)` for predictable keyframe spacing
+
+These defaults require no additional flags and do not change the existing CLI behavior.
+
 ## Logging and privacy
 
 - Default: Script log lines appear in terminal; raw tool output goes to `pipr.log`.
