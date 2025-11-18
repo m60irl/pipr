@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
 # Usage:
-#   pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
+#   pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] \
+#        [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] \
+#        [--keyframe-interval <seconds|frames>] [--fps <rate>] \
+#        [--analyzeduration <value>] [--probesize <value>] \
+#        [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] \
+#        "<source_url>" "<rtmp_endpoint>"
 # Examples:
 #   pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
-#   pipr --force-encoding --encoder libx264 --bitrate 4500k --preset veryfast "https://www.twitch.tv/<channel>" "rtmp://your-endpoint/live/key"
-#   pipr -v --preset fast --encoder h264_nvenc --audio-bitrate 160k --audio-rate 48k --keyframe-interval 2s --fps 60 "https://www.example.com/video" "rtmp://your-endpoint/live/key"
+#   pipr --force-encoding --encoder libx264 --bitrate 4500k --preset veryfast \
+#        "https://www.twitch.tv/<channel>" "rtmp://your-endpoint/live/key"
+#   pipr -v --preset fast --encoder h264_nvenc --audio-bitrate 160k --audio-rate 48k \
+#        --keyframe-interval 2s --fps 60 "https://www.example.com/video" "rtmp://your-endpoint/live/key"
 
 set -e
 
@@ -95,9 +102,13 @@ FPS=""        # optional, used to align -g with seconds-based keyframe interval
 ANALYZEDURATION="20M"
 PROBESIZE="100M"
 
+# yt-dlp pass-through support
+YTDLP_ARGS=()
+YTDLP_FORMAT='bestvideo*+bestaudio/best'
+
 print_help() {
   cat <<EOF
-Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
+Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
 
 Options:
   -v                         Verbose mode; mirror yt-dlp/ffmpeg output to terminal and log.
@@ -112,6 +123,8 @@ Options:
   --fps <rate>               When using a seconds-based interval, also set -g = seconds*fps for encoders that prefer it.
   --analyzeduration <value>  ffmpeg analyzeduration (default: 20M).
   --probesize <value>        ffmpeg probesize (default: 100M).
+  --ytdlp-format <fmt>       yt-dlp format selector (default: bestvideo*+bestaudio/best).
+  --ytdlp-arg <arg>          Additional yt-dlp argument (repeatable). Example: --ytdlp-arg "--cookies cookies.txt"
   -h, --help                 Show this help and exit.
 
 Notes:
@@ -135,6 +148,8 @@ while [[ $# -gt 0 ]]; do
     --fps) [[ -n "${2-}" ]] || err "Missing value for $1"; FPS="$2"; shift 2 ;;
     --analyzeduration) [[ -n "${2-}" ]] || err "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;;
     --probesize) [[ -n "${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;;
+    --ytdlp-arg) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_ARGS+=( "$2" ); shift 2 ;;
+    --ytdlp-format) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_FORMAT="$2"; shift 2 ;;
     -h|--help) print_help; exit 0 ;;
     --) shift; break ;;
     -*) err "Unknown option: $1" ;;
@@ -146,7 +161,7 @@ STREAM_URL="${1-}"
 RTMP_ENDPOINT="${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
-  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>"
+  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] \"<source_url>\" \"<rtmp_endpoint>\""
 fi
 
 for cmd in yt-dlp ffmpeg; do
@@ -164,18 +179,17 @@ log "[pipr] Source domain detected: $DOMAIN"
 if [[ $FORCE_ENCODING -eq 1 ]]; then
   log "[pipr] Force encoding enabled; stream copy attempt will be skipped."
 fi
-log "[pipr] Encoding settings: encoder=$ENCODER preset=$PRESET vbitrate=${VBITRATE:-default} abitrate=${ABITRATE:-default} arate=${ARATE:-default} gop=${GOP:-default} keyint=${KEYINT:-default} fps=${FPS:-unset}"
+log "[pipr] Encoding settings: encoder=$ENCODER preset=$PRESET vbitrate=${VBITRATE:-default} abitrate=${ABITRATE:-default} arate=${ARATE:-default} gop=${GOP:-default} keyint=${KEYINT:-default} fps=${FPS:-default}"
 log "[pipr] Buffering: analyzeduration=$ANALYZEDURATION probesize=$PROBESIZE"
 
 #######################
 # Get direct URL       #
 #######################
 log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
-YTDLP_FORMAT='bestvideo*+bestaudio/best'
 if [[ $VERBOSE -eq 1 ]]; then
-  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
 else
-  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
 fi
 
 if [[ ${#MEDIA_URLS[@]} -eq 0 ]]; then
@@ -245,7 +259,7 @@ run_ffmpeg_encode() {
     else
       log "[pipr] Warning: invalid --keyframe-interval value '$val'; ignoring"
     fi
-  } elif [[ -n "$GOP" ]]; then
+  elif [[ -n "$GOP" ]]; then
     extra+=( -g "$GOP" -sc_threshold 0 )
   fi
 
