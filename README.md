@@ -1,6 +1,6 @@
 # pipr
 
-**pipr** is a universal shell tool for piping any video or livestream (YouTube, Twitch, Kick, Odysee, YouNow, etc – see [yt-dlp’s supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)) to an RTMP endpoint (e.g., Restream, Twitch, YouTube Live), using `yt-dlp` and `ffmpeg`. It auto-detects the source, extracts the best stream URL, attempts stream copy first, and falls back to re-encoding if needed. All actions and errors are logged in `pipr.log`, with sensitive endpoints sanitized.
+**pipr** is a universal shell tool for piping any video or livestream (YouTube, Twitch, Kick, Odysee, YouNow, etc – see [yt-dlp’s supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)) to RTMP endpoints using `yt-dlp` and `ffmpeg`.
 
 ## Features
 
@@ -13,6 +13,7 @@
 - Input resilience: reconnect flags for HTTP(S) sources
 - Tunable buffering: `analyzeduration` and `probesize` (defaults preserved: 20M/100M)
 - Robust logging with sanitizer: masks RTMP endpoints and reduces HTTP(S) URLs to `protocol://host/...`
+- yt-dlp pass-through flags for cookies/headers/custom format selection
 
 ## Requirements
 
@@ -45,6 +46,19 @@ pipr --force-encoding --encoder libx264 --bitrate 6000k --preset fast \
 # Keep buffering defaults explicitly (values are tunable, defaults preserved):
 pipr --analyzeduration 20M --probesize 100M \
      "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
+
+# yt-dlp: pass cookies file (repeatable --ytdlp-arg)
+pipr --ytdlp-arg "--cookies cookies.txt" \
+     "https://www.example.com/live" "rtmp://your-endpoint/live/stream_key"
+
+# yt-dlp: add custom headers (repeatable)
+pipr --ytdlp-arg "--add-header" --ytdlp-arg "Authorization: Bearer <TOKEN>" \
+     "https://www.example.com/live" "rtmp://your-endpoint/live/stream_key"
+
+# yt-dlp: override format selection
+# Prefer H.264/AAC where possible for higher chance of copy-first success
+pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
+     "https://www.example.com/v" "rtmp://your-endpoint/live/stream_key"
 ```
 
 ## Flags
@@ -71,6 +85,12 @@ pipr --analyzeduration 20M --probesize 100M \
 - Buffering and probing
   - `--analyzeduration <value>`: ffmpeg analyzeduration (default: `20M`).
   - `--probesize <value>`: ffmpeg probesize (default: `100M`).
+
+- yt-dlp pass-through
+  - `--ytdlp-format <fmt>`: Override yt-dlp format selector (default: `bestvideo*+bestaudio/best`).
+  - `--ytdlp-arg <arg>`: Pass-through argument to yt-dlp. Repeatable. Examples:
+    - `--ytdlp-arg "--cookies cookies.txt"`
+    - `--ytdlp-arg "--add-header" --ytdlp-arg "Authorization: Bearer <TOKEN>"`
 
 Notes on precedence
 - Copy-first: Without `--force-encoding`, the tool tries `-c copy` first. If copy fails, it re-encodes using your flags.
