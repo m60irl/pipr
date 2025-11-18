@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
 # Usage: pipr [-v] <media_url> <rtmp_endpoint>
 # Example: pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
@@ -40,7 +40,7 @@ mask_rtmp() {
     echo "${no_query%/}/***"
     return
   fi
-  local tail=''
+  local tail=""
   if [[ \\$#key -gt 4 ]]; then
     tail="${key: -4}"
     echo "${base}/***${tail}"
