@@ -42,6 +42,7 @@ pipr --force-encoding --encoder libx264 --bitrate 4500k --preset veryfast \
 pipr --force-encoding --encoder libx264 --bitrate 6000k --preset fast \
      --keyframe-interval 2s --fps 60 \
      "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
+# With --fps provided, this sets -g ~120 (2s * 60fps), -r 60, and -vsync cfr for predictable CFR/GOP.
 
 # Keep buffering defaults explicitly (values are tunable, defaults preserved):
 pipr --analyzeduration 20M --probesize 100M \
@@ -95,6 +96,22 @@ pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
 Notes on precedence
 - Copy-first: Without `--force-encoding`, the tool tries `-c copy` first. If copy fails, it re-encodes using your flags.
 - If both `--keyframe-interval` and `--gop` are provided, `--keyframe-interval` takes precedence.
+
+## Production defaults
+
+pipr applies production-hardened defaults for reliability and compatibility:
+
+- **Input handling**: `-re` (real-time reading) is applied only to non-HTTP(S) inputs (local files/pipes) to avoid adding latency to live HTTP/HLS streams.
+- **Network resilience**: HTTP(S) inputs automatically include `-rw_timeout 15s` (read/write timeout) and `-http_persistent 0` (disable persistent connections) along with reconnect flags for improved stability.
+- **Encoding compatibility**: When re-encoding (fallback or `--force-encoding`):
+  - `-pix_fmt yuv420p` ensures broad player/decoder compatibility.
+  - `-ac 2` (stereo audio) is set by default.
+  - When `--bitrate` is specified, `-maxrate` and `-bufsize` are automatically added to stabilize rate control.
+- **Predictable GOP/CFR**: When using `--keyframe-interval` in seconds (e.g., `2s`) with `--fps` (e.g., `60`), pipr also sets `-r <fps>` and `-vsync cfr` for constant frame rate and predictable GOP spacing, in addition to computing `-g` (GOP size in frames).
+- **Error handling**: The script uses strict mode (`set -euo pipefail -E`) with traps for graceful signal handling (INT/TERM) and error tracing.
+- **URL sanitizer robustness**: Fixed to handle trailing punctuation (including `>`, `<`) without shell syntax errors.
+
+These defaults require no CLI changes and are applied automatically based on input type and provided flags.
 
 ## Logging and privacy
 
