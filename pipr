@@ -1,0 +1,96 @@
+#!/bin/bash
+# pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
+# Usage: ./pipr [-v] <media_url> <rtmp_endpoint>
+# Example: ./pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
+# Example: ./pipr "https://www.twitch.tv/<channelname>" "rtmp://your-endpoint/live/stream_key"
+# Example: ./pipr -v "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
+
+set -e
+
+#####################
+# Logging Functions #
+#####################
+LOGFILE="pipr.log"
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
+}
+err() {
+  log "ERROR: $*"
+  exit 1
+}
+
+#############################
+# Parse Arguments and Flags #
+#############################
+VERBOSE=0
+if [[ "$1" == "-v" ]]; then
+  VERBOSE=1
+  shift
+fi
+
+STREAM_URL="$1"
+RTMP_ENDPOINT="$2"
+
+if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
+  err "Usage: $0 [-v] <media_url> <rtmp_endpoint>"
+fi
+
+for cmd in yt-dlp ffmpeg; do
+  if ! command -v "$cmd" &>/dev/null; then
+    err "Required command '$cmd' not found. Please install it."
+  fi
+done
+
+###################################
+# Identify source domain for log  #
+###################################
+DOMAIN=$(echo "$STREAM_URL" | sed -E 's_https?://([^/]+).*_\\1_' | tr -d '\n')
+log "[pipr] Source domain detected: $DOMAIN ($STREAM_URL)"
+
+#####################
+# Get direct URL    #
+#####################
+log "[pipr] Getting media stream URL from yt-dlp for: $STREAM_URL"
+if [[ $VERBOSE -eq 1 ]]; then
+  MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL") || err "[pipr] yt-dlp failed to get stream URL"
+else
+  MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL" 2>>"$LOGFILE") || err "[pipr] yt-dlp failed to get stream URL"
+fi
+
+log "[pipr] Got direct stream url: $MEDIA_URL"
+log "[pipr] Streaming to RTMP endpoint: $RTMP_ENDPOINT"
+
+#########################################
+# Streaming with ffmpeg + error fallback#
+#########################################
+log "[pipr] Attempting to stream using codec copy (-c copy)..."
+if [[ $VERBOSE -eq 1 ]]; then
+  ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+    -c copy -f flv "$RTMP_ENDPOINT"
+  FFMPEG_EXIT=$?
+else
+  ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+    -c copy -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2>&1
+  FFMPEG_EXIT=$?
+fi
+
+if [[ $FFMPEG_EXIT -ne 0 ]]; then
+  log "[pipr] Codec copy failed (exit $FFMPEG_EXIT). Retrying with re-encoding (libx264/aac)..."
+  if [[ $VERBOSE -eq 1 ]]; then
+    ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+      -c:v libx264 -preset veryfast -c:a aac -f flv "$RTMP_ENDPOINT"
+    FFMPEG_EXIT=$?
+  else
+    ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+      -c:v libx264 -preset veryfast -c:a aac -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2>&1
+    FFMPEG_EXIT=$?
+  fi
+
+  if [[ $FFMPEG_EXIT -ne 0 ]]; then
+    err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
+  else
+    log "[pipr] Stream succeeded after re-encoding."
+  fi
+else
+  log "[pipr] Stream succeeded with stream copy."
+}
