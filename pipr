@@ -41,7 +41,7 @@ mask_rtmp() {
     return
   fi
   local tail=''
-  if [[ ${#key} -gt 4 ]]; then
+  if [[ \\$#key -gt 4 ]]; then
     tail="${key: -4}"
     echo "${base}/***${tail}"
   else
