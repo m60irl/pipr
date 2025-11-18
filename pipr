@@ -41,7 +41,7 @@ mask_rtmp() {
     return
   fi
   local tail=""
-  if [[ \\$#key -gt 4 ]]; then
+  if [[ \\${#key} -gt 4 ]]; then
     tail="${key: -4}"
     echo "${base}/***${tail}"
   else
@@ -74,7 +74,7 @@ done
 ###################################
 # Identify source domain for log  #
 ###################################
-DOMAIN="$(host_from_url "${STREAM_URL}")"
+DOMAIN="")(host_from_url "${STREAM_URL}")"
 log "[pipr] Source domain detected: $DOMAIN"
 
 #####################
@@ -87,8 +87,8 @@ else
   MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL" 2>>"$LOGFILE") || err "[pipr] yt-dlp failed to get stream URL"
 fi
 
-MEDIA_HOST="$(host_from_url "$MEDIA_URL")"
-MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
+MEDIA_HOST="(host_from_url "$MEDIA_URL")"
+MASKED_RTMP="(mask_rtmp "$RTMP_ENDPOINT")"
 
 log "[pipr] Resolved media host: $MEDIA_HOST"
 log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
