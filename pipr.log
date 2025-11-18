@@ -1,0 +1,1 @@
+2025-11-18 22:51:02 ERROR: Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"

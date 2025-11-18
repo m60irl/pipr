@@ -40,6 +40,8 @@ handle_error() {
 handle_shutdown() {
   local sig=$1
   log "[pipr] Caught signal $sig, shutting down..."
+  # Disable traps to prevent recursion
+  trap - INT TERM ERR
   # Kill all processes in the current process group
   kill 0 2>/dev/null || true
   exit 1
