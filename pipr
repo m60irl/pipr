@@ -60,7 +60,7 @@ filter_stderr() {
       [[ -z "$token" ]] && continue
       local url="$token"
       # Trim common trailing punctuation and quotes from token to get the raw URL
-      while [[ "$url" =~ [",)\]\.:'\)]$ ]]; do url="${url%?}"; done
+      while [[ "$url" =~ [",)\]\>\.;:'\)]$ ]]; do url="${url%?}"; done
       [[ -z "$url" ]] && continue
       local replacement=""
       if [[ "$url" =~ ^rtmps?:// ]]; then
@@ -123,27 +123,27 @@ EOF
 # Simple long-option parser
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -v) VERBOSE=1; shift ;; 
+    -v) VERBOSE=1; shift ;;
     --force-encoding) FORCE_ENCODING=1; shift ;;
-    --encoder) [[ -n "${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;; 
-    --bitrate|--vb|--video-bitrate) [[ -n "${2-}" ]] || err "Missing value for $1"; VBITRATE="$2"; shift 2 ;; 
-    --preset) [[ -n "${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;; 
-    --audio-bitrate|--ab) [[ -n "${2-}" ]] || err "Missing value for $1"; ABITRATE="$2"; shift 2 ;; 
-    --audio-rate|--ar) [[ -n "${2-}" ]] || err "Missing value for $1"; ARATE="$2"; shift 2 ;; 
-    --gop) [[ -n "${2-}" ]] || err "Missing value for $1"; GOP="$2"; shift 2 ;; 
-    --keyframe-interval|--keyint) [[ -n "${2-}" ]] || err "Missing value for $1"; KEYINT="$2"; shift 2 ;; 
-    --fps) [[ -n "${2-}" ]] || err "Missing value for $1"; FPS="$2"; shift 2 ;; 
-    --analyzeduration) [[ -n "${2-}" ]] || err "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;; 
-    --probesize) [[ -n "${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;; 
-    -h|--help) print_help; exit 0 ;; 
-    --) shift; break ;; 
-    -*) err "Unknown option: $1" ;; 
-    *) break ;; 
+    --encoder) [[ -n "${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;;
+    --bitrate|--vb|--video-bitrate) [[ -n "${2-}" ]] || err "Missing value for $1"; VBITRATE="$2"; shift 2 ;;
+    --preset) [[ -n "${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;;
+    --audio-bitrate|--ab) [[ -n "${2-}" ]] || err "Missing value for $1"; ABITRATE="$2"; shift 2 ;;
+    --audio-rate|--ar) [[ -n "${2-}" ]] || err "Missing value for $1"; ARATE="$2"; shift 2 ;;
+    --gop) [[ -n "${2-}" ]] || err "Missing value for $1"; GOP="$2"; shift 2 ;;
+    --keyframe-interval|--keyint) [[ -n "${2-}" ]] || err "Missing value for $1"; KEYINT="$2"; shift 2 ;;
+    --fps) [[ -n "${2-}" ]] || err "Missing value for $1"; FPS="$2"; shift 2 ;;
+    --analyzeduration) [[ -n "${2-}" ]] || err "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;;
+    --probesize) [[ -n "${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;;
+    -h|--help) print_help; exit 0 ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1" ;;
+    *) break ;;
   esac
 done
 
-STREAM_URL=""${1-}"
-RTMP_ENDPOINT=""${2-}"
+STREAM_URL="${1-}"
+RTMP_ENDPOINT="${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
   err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>"
@@ -193,8 +193,8 @@ log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration "$ANALYZEDURATION" -probesize "$PROBESIZE" -re)
 MAP_ARGS=()
 # Append per-input reconnect flags (for HTTP/S) and -i
-for idx in "">${!MEDIA_URLS[@]}"; do
-  url=""${MEDIA_URLS[$idx]}""
+for idx in "${!MEDIA_URLS[@]}"; do
+  url="${MEDIA_URLS[$idx]}"
   if [[ "$url" =~ ^https?:// ]]; then
     FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
   fi
@@ -212,11 +212,11 @@ done
 run_ffmpeg_copy() {
   set +e
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg ""${FFMPEG_INPUT_ARGS[@]}"" -c copy ""${MAP_ARGS[@]}"" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
   else
-    ffmpeg ""${FFMPEG_INPUT_ARGS[@]}"" -c copy ""${MAP_ARGS[@]}"" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
   fi
-  local exit_code="$?"
+  local exit_code=$?
   set -e
   return $exit_code
 }
@@ -240,21 +240,21 @@ run_ffmpeg_encode() {
         gframes=$(awk -v s="$sec" -v f="$FPS" 'BEGIN{printf "%d", s*f + 0.5}')
         if [[ "$gframes" -gt 0 ]]; then extra+=( -g "$gframes" ); fi
       fi
-    } elif [[ "$val" =~ ^[0-9]+$ ]]; then
+    elif [[ "$val" =~ ^[0-9]+$ ]]; then
       extra+=( -g "$val" -sc_threshold 0 )
-    } else {
+    else
       log "[pipr] Warning: invalid --keyframe-interval value '$val'; ignoring"
-    }
+    fi
   } elif [[ -n "$GOP" ]]; then
     extra+=( -g "$GOP" -sc_threshold 0 )
   fi
 
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg ""${FFMPEG_INPUT_ARGS[@]}"" ""${MAP_ARGS[@]}"" -c:v "$ENCODER" -preset "$PRESET" -c:a aac ""${extra[@]}"" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
   else
-    ffmpeg ""${FFMPEG_INPUT_ARGS[@]}"" ""${MAP_ARGS[@]}"" -c:v "$ENCODER" -preset "$PRESET" -c:a aac ""${extra[@]}"" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
   fi
-  local exit_code="$?"
+  local exit_code=$?
   set -e
   return $exit_code
 }
