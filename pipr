@@ -1,9 +1,9 @@
 #!/bin/bash
 # pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
-# Usage: ./pipr [-v] <media_url> <rtmp_endpoint>
-# Example: ./pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
-# Example: ./pipr "https://www.twitch.tv/<channelname>" "rtmp://your-endpoint/live/stream_key"
-# Example: ./pipr -v "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
+# Usage: pipr [-v] <media_url> <rtmp_endpoint>
+# Example: pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
+# Example: pipr "https://www.twitch.tv/<channelname>" "rtmp://your-endpoint/live/stream_key"
+# Example: pipr -v "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
 
 set -e
 
@@ -17,6 +17,36 @@ log() {
 err() {
   log "ERROR: $*"
   exit 1
+}
+
+################################
+# Privacy/utility helper funcs #
+################################
+host_from_url() {
+  # Prints only the host of a URL (scheme-agnostic)
+  # Example: https://example.com/path?a=b -> example.com
+  local url="$1"
+  echo "$url" | sed -E 's_https?://([^/]+).*_\1_' | tr -d '\n'
+}
+
+mask_rtmp() {
+  # Masks the last path segment (e.g., stream key) but keeps a short tail
+  # Example: rtmp://server/app/abcdef123 -> rtmp://server/app/***e123
+  local url="$1"
+  local no_query="${url%%\?*}"
+  local base="${no_query%/*}"
+  local key="${no_query##*/}"
+  if [[ -z "$key" || "$base" == "$no_query" ]]; then
+    echo "${no_query%/}/***"
+    return
+  fi
+  local tail=''
+  if [[ ${#key} -gt 4 ]]; then
+    tail="${key: -4}"
+    echo "${base}/***${tail}"
+  else
+    echo "${base}/***"
+  fi
 }
 
 #############################
@@ -44,47 +74,57 @@ done
 ###################################
 # Identify source domain for log  #
 ###################################
-DOMAIN=$(echo "$STREAM_URL" | sed -E 's_https?://([^/]+).*_\\1_' | tr -d '\n')
-log "[pipr] Source domain detected: $DOMAIN ($STREAM_URL)"
+DOMAIN="$(host_from_url "${STREAM_URL}")"
+log "[pipr] Source domain detected: $DOMAIN"
 
 #####################
 # Get direct URL    #
 #####################
-log "[pipr] Getting media stream URL from yt-dlp for: $STREAM_URL"
+log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
 if [[ $VERBOSE -eq 1 ]]; then
   MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL") || err "[pipr] yt-dlp failed to get stream URL"
 else
   MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL" 2>>"$LOGFILE") || err "[pipr] yt-dlp failed to get stream URL"
 fi
 
-log "[pipr] Got direct stream url: $MEDIA_URL"
-log "[pipr] Streaming to RTMP endpoint: $RTMP_ENDPOINT"
+MEDIA_HOST="$(host_from_url "$MEDIA_URL")"
+MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
+
+log "[pipr] Resolved media host: $MEDIA_HOST"
+log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 
 #########################################
 # Streaming with ffmpeg + error fallback#
 #########################################
 log "[pipr] Attempting to stream using codec copy (-c copy)..."
+
+# Temporarily disable set -e so we can capture ffmpeg exit status
+set +e
 if [[ $VERBOSE -eq 1 ]]; then
-  ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+  ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
     -c copy -f flv "$RTMP_ENDPOINT"
   FFMPEG_EXIT=$?
 else
-  ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+  ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
     -c copy -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2>&1
   FFMPEG_EXIT=$?
 fi
+set -e
 
 if [[ $FFMPEG_EXIT -ne 0 ]]; then
   log "[pipr] Codec copy failed (exit $FFMPEG_EXIT). Retrying with re-encoding (libx264/aac)..."
+
+  set +e
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+    ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
       -c:v libx264 -preset veryfast -c:a aac -f flv "$RTMP_ENDPOINT"
     FFMPEG_EXIT=$?
   else
-    ffmpeg -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
+    ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" \
       -c:v libx264 -preset veryfast -c:a aac -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2>&1
     FFMPEG_EXIT=$?
   fi
+  set -e
 
   if [[ $FFMPEG_EXIT -ne 0 ]]; then
     err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
@@ -93,4 +133,4 @@ if [[ $FFMPEG_EXIT -ne 0 ]]; then
   fi
 else
   log "[pipr] Stream succeeded with stream copy."
-}
+fi
