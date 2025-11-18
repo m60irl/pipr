@@ -14,7 +14,7 @@
 #   pipr -v --preset fast --encoder h264_nvenc --audio-bitrate 160k --audio-rate 48k \
 #        --keyframe-interval 2s --fps 60 "https://www.example.com/video" "rtmp://your-endpoint/live/key"
 
-set -e
+set -euo pipefail -E
 
 #####################
 # Logging Functions #
@@ -27,6 +27,29 @@ err() {
   log "ERROR: $*"
   exit 1
 }
+
+###################
+# Error & Signal Handling #
+###################
+handle_error() {
+  local exit_code=$?
+  local line_no=$1
+  log "ERROR: Command failed at line $line_no with exit code $exit_code"
+}
+
+handle_shutdown() {
+  local sig=$1
+  log "[pipr] Caught signal $sig, shutting down..."
+  # Disable traps to prevent recursion
+  trap - INT TERM ERR
+  # Kill all processes in the current process group
+  kill 0 2>/dev/null || true
+  exit 1
+}
+
+trap 'handle_error $LINENO' ERR
+trap 'handle_shutdown INT' INT
+trap 'handle_shutdown TERM' TERM
 
 ################################
 # Privacy/utility helper funcs #
@@ -67,7 +90,7 @@ filter_stderr() {
       [[ -z "$token" ]] && continue
       local url="$token"
       # Trim common trailing punctuation and quotes from token to get the raw URL
-      while [[ "$url" =~ [",)\]\>\.;:'\)]$ ]]; do url="${url%?}"; done
+      while [[ "$url" =~ [",)\]>.;:'"]$ ]]; do url="${url%?}"; done
       [[ -z "$url" ]] && continue
       local replacement=""
       if [[ "$url" =~ ^rtmps?:// ]]; then
@@ -204,13 +227,17 @@ log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 #########################################
 # Build input args (multi-URL handling) #
 #########################################
-FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration "$ANALYZEDURATION" -probesize "$PROBESIZE" -re)
+FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration "$ANALYZEDURATION" -probesize "$PROBESIZE")
 MAP_ARGS=()
 # Append per-input reconnect flags (for HTTP/S) and -i
 for idx in "${!MEDIA_URLS[@]}"; do
   url="${MEDIA_URLS[$idx]}"
   if [[ "$url" =~ ^https?:// ]]; then
-    FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
+    # HTTP/S input: add network resilience flags
+    FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 -http_persistent 0 )
+  else
+    # Non-HTTP input: apply -re to throttle reading
+    FFMPEG_INPUT_ARGS+=( -re )
   fi
   FFMPEG_INPUT_ARGS+=( -i "$url" )
   # Build stream mapping if we have 2 inputs (0=video, 1=audio)
@@ -238,8 +265,12 @@ run_ffmpeg_copy() {
 run_ffmpeg_encode() {
   set +e
   local extra=()
+  # Compatibility defaults for RTMP/FLV
+  extra+=( -pix_fmt yuv420p -ac 2 )
   # Bitrate and audio tuning
-  if [[ -n "$VBITRATE" ]]; then extra+=( -b:v "$VBITRATE" ); fi
+  if [[ -n "$VBITRATE" ]]; then
+    extra+=( -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "$VBITRATE" )
+  fi
   if [[ -n "$ABITRATE" ]]; then extra+=( -b:a "$ABITRATE" ); fi
   if [[ -n "$ARATE" ]]; then extra+=( -ar "$ARATE" ); fi
   # GOP / keyframe interval
@@ -252,7 +283,9 @@ run_ffmpeg_encode() {
         # Compute frames = round(sec * fps) using awk
         local gframes
         gframes=$(awk -v s="$sec" -v f="$FPS" 'BEGIN{printf "%d", s*f + 0.5}')
-        if [[ "$gframes" -gt 0 ]]; then extra+=( -g "$gframes" ); fi
+        if [[ "$gframes" -gt 0 ]]; then
+          extra+=( -g "$gframes" -r "$FPS" -vsync cfr )
+        fi
       fi
     elif [[ "$val" =~ ^[0-9]+$ ]]; then
       extra+=( -g "$val" -sc_threshold 0 )
