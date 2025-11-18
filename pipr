@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
 # Usage:
-#   pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
+#   pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
 # Examples:
 #   pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 #   pipr --force-encoding --encoder libx264 --bitrate 4500k --preset veryfast "https://www.twitch.tv/<channel>" "rtmp://your-endpoint/live/key"
-#   pipr -v --preset fast --encoder h264_nvenc --audio-bitrate 160k --audio-rate 48k --gop 120 "https://www.example.com/video" "rtmp://your-endpoint/live/key"
+#   pipr -v --preset fast --encoder h264_nvenc --audio-bitrate 160k --audio-rate 48k --keyframe-interval 2s --fps 60 "https://www.example.com/video" "rtmp://your-endpoint/live/key"
 
 set -e
 
@@ -39,7 +39,7 @@ mask_rtmp() {
   local base="${no_query%/*}"
   local key="${no_query##*/}"
   if [[ -z "$key" || "$base" == "$no_query" ]]; then
-    echo "">${no_query%/}/***"
+    echo "${no_query%/}/***"
     return
   fi
   local tail=""
@@ -72,7 +72,8 @@ filter_stderr() {
         replacement="${proto}://${host}/..."
       fi
       if [[ -n "$replacement" ]]; then
-        out="${out//"$url"/"$replacement"}"
+        out="
+${out//"$url"/"$replacement"}"
       fi
     done < <(grep -Eo '((rtmps?|https?)://[^[:space:]]+)' <<<"$line" || true)
     echo "$out"
@@ -90,12 +91,14 @@ PRESET="veryfast"
 ABITRATE=""   # e.g., 128k, 160k
 ARATE=""      # e.g., 44100, 48k
 GOP=""        # keyframe interval in frames
+KEYINT=""     # keyframe interval in seconds or frames (with s suffix for seconds)
+FPS=""        # optional, used to align -g with seconds-based keyframe interval
 ANALYZEDURATION="20M"
 PROBESIZE="100M"
 
 print_help() {
   cat <<EOF
-Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
+Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>
 
 Options:
   -v                         Verbose mode; mirror yt-dlp/ffmpeg output to terminal and log.
@@ -105,7 +108,9 @@ Options:
   --preset <preset>          Encoder preset (default: veryfast). Examples: veryfast, fast, medium.
   --audio-bitrate <abitrate> Audio bitrate (e.g., 128k, 160k). Default: encoder default.
   --audio-rate <arate>       Audio sample rate (e.g., 44100, 48k). Default: source/default.
-  --gop <frames>             GOP size (keyframe interval in frames). If set, applies -g <frames> and -sc_threshold 0.
+  --gop <frames>             GOP size (keyframe interval in frames). Applies -g <frames> and -sc_threshold 0.
+  --keyframe-interval <v>    Keyframe interval in seconds (e.g., 2s) or frames (e.g., 120). Overrides --gop.
+  --fps <rate>               When using a seconds-based interval, also set -g = seconds*fps for encoders that prefer it.
   --analyzeduration <value>  ffmpeg analyzeduration (default: 20M).
   --probesize <value>        ffmpeg probesize (default: 100M).
   -h, --help                 Show this help and exit.
@@ -120,35 +125,41 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -v) VERBOSE=1; shift ;; 
-    --force-encoding) FORCE_ENCODING=1; shift ;;
+    --force-encoding) FORCE_ENCODING=1; shift ;; 
     --encoder) [[ -n "
-${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;;  
+${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;; 
     --bitrate|--vb|--video-bitrate) [[ -n "
 ${2-}" ]] || err "Missing value for $1"; VBITRATE="$2"; shift 2 ;; 
     --preset) [[ -n "
-${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;;  
+${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;; 
     --audio-bitrate|--ab) [[ -n "
 ${2-}" ]] || err "Missing value for $1"; ABITRATE="$2"; shift 2 ;; 
     --audio-rate|--ar) [[ -n "
-${2-}" ]] || err "Missing value for $1"; ARATE="$2"; shift 2 ;;  
+${2-}" ]] || err "Missing value for $1"; ARATE="$2"; shift 2 ;; 
     --gop) [[ -n "
-${2-}" ]] || err "Missing value for $1"; GOP="$2"; shift 2 ;;  
+${2-}" ]] || err "Missing value for $1"; GOP="$2"; shift 2 ;; 
+    --keyframe-interval|--keyint) [[ -n "
+${2-}" ]] || err "Missing value for $1"; KEYINT="$2"; shift 2 ;; 
+    --fps) [[ -n "
+${2-}" ]] || err "Missing value for $1"; FPS="$2"; shift 2 ;; 
     --analyzeduration) [[ -n "
 ${2-}" ]] || err "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;; 
     --probesize) [[ -n "
 ${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;; 
-    -h|--help) print_help; exit 0 ;;  
-    --) shift; break ;;
-    -*) err "Unknown option: $1" ;;  
-    *) break ;;
+    -h|--help) print_help; exit 0 ;; 
+    --) shift; break ;; 
+    -*) err "Unknown option: $1" ;; 
+    *) break ;; 
   esac
 done
 
-STREAM_URL="${1-}"
-RTMP_ENDPOINT="${2-}"
+STREAM_URL="
+${1-}"
+RTMP_ENDPOINT="
+${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
-  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>"
+  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <seconds|frames>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] <media_url> <rtmp_endpoint>"
 fi
 
 for cmd in yt-dlp ffmpeg; do
@@ -166,7 +177,13 @@ log "[pipr] Source domain detected: $DOMAIN"
 if [[ $FORCE_ENCODING -eq 1 ]]; then
   log "[pipr] Force encoding enabled; stream copy attempt will be skipped."
 fi
-log "[pipr] Encoding settings: encoder=$ENCODER preset=$PRESET vbitrate=${VBITRATE:-default} abitrate=${ABITRATE:-default} arate=${ARATE:-default} gop=${GOP:-default}"
+log "[pipr] Encoding settings: encoder=$ENCODER preset=$PRESET vbitrate=
+${VBITRATE:-default} abitrate=
+${ABITRATE:-default} arate=
+${ARATE:-default} gop=
+${GOP:-default} keyint=
+${KEYINT:-default} fps=
+${FPS:-unset}"
 log "[pipr] Buffering: analyzeduration=$ANALYZEDURATION probesize=$PROBESIZE"
 
 #######################
@@ -180,11 +197,12 @@ else
   mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
 fi
 
-if [[ ${#MEDIA_URLS[@]} -eq 0 ]]; then
+if [[ \\${#MEDIA_URLS[@]} -eq 0 ]]; then
   err "[pipr] No media URLs returned by yt-dlp"
 fi
 
-MEDIA_HOST="$(host_from_url "${MEDIA_URLS[0]}")"
+MEDIA_HOST="$(host_from_url "
+${MEDIA_URLS[0]}")"
 MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
 log "[pipr] Resolved media host: $MEDIA_HOST"
 log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
@@ -195,14 +213,16 @@ log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration "$ANALYZEDURATION" -probesize "$PROBESIZE" -re)
 MAP_ARGS=()
 # Append per-input reconnect flags (for HTTP/S) and -i
-for idx in "${!MEDIA_URLS[@]}"; do
-  url="${MEDIA_URLS[$idx]}"
+for idx in "
+${!MEDIA_URLS[@]}"; do
+  url="
+${MEDIA_URLS[$idx]}"
   if [[ "$url" =~ ^https?:// ]]; then
     FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
   fi
   FFMPEG_INPUT_ARGS+=( -i "$url" )
   # Build stream mapping if we have 2 inputs (0=video, 1=audio)
-  if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
+  if [[ \\${#MEDIA_URLS[@]} -ge 2 ]]; then
     if [[ $idx -eq 0 ]]; then MAP_ARGS+=( -map 0:v:0 ); fi
     if [[ $idx -eq 1 ]]; then MAP_ARGS+=( -map 1:a:0 ); fi
   fi
@@ -214,11 +234,9 @@ done
 run_ffmpeg_copy() {
   set +e
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg \
-${FFMPEG_INPUT_ARGS[@]} -c copy ${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    ffmpeg \\${FFMPEG_INPUT_ARGS[@]} -c copy \\${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
   else
-    ffmpeg \
-${FFMPEG_INPUT_ARGS[@]} -c copy ${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    ffmpeg \\${FFMPEG_INPUT_ARGS[@]} -c copy \\${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
   fi
   local exit_code=$?
   set -e
@@ -228,17 +246,37 @@ ${FFMPEG_INPUT_ARGS[@]} -c copy ${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFI
 run_ffmpeg_encode() {
   set +e
   local extra=()
+  # Bitrate and audio tuning
   if [[ -n "$VBITRATE" ]]; then extra+=( -b:v "$VBITRATE" ); fi
   if [[ -n "$ABITRATE" ]]; then extra+=( -b:a "$ABITRATE" ); fi
   if [[ -n "$ARATE" ]]; then extra+=( -ar "$ARATE" ); fi
-  if [[ -n "$GOP" ]]; then extra+=( -g "$GOP" -sc_threshold 0 ); fi
+  # GOP / keyframe interval
+  if [[ -n "$KEYINT" ]]; then
+    local val="$KEYINT"
+    if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?s$ ]]; then
+      local sec="
+${val%s}"
+      extra+=( -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*${sec})" )
+      if [[ -n "$FPS" && "$FPS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        # Compute frames = round(sec * fps) using awk
+        local gframes
+        gframes=$(awk -v s="
+${sec}" -v f="$FPS" 'BEGIN{printf "%d", s*f + 0.5}')
+        if [[ "$gframes" -gt 0 ]]; then extra+=( -g "$gframes" ); fi
+      fi
+    } elif [[ "$val" =~ ^[0-9]+$ ]]; then
+      extra+=( -g "$val" -sc_threshold 0 )
+    else
+      log "[pipr] Warning: invalid --keyframe-interval value '$val'; ignoring"
+    fi
+  } elif [[ -n "$GOP" ]]; then
+    extra+=( -g "$GOP" -sc_threshold 0 )
+  fi
 
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg \
-${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac ${extra[@]} -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    ffmpeg \\${FFMPEG_INPUT_ARGS[@]} \\${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac \\${extra[@]} -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
   else
-    ffmpeg \
-${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac ${extra[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    ffmpeg \\${FFMPEG_INPUT_ARGS[@]} \\${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac \\${extra[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
   fi
   local exit_code=$?
   set -e
