@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # pipr: Pipe ANY supported livestream/video to an RTMP endpoint using yt-dlp and ffmpeg.
-# Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] <media_url> <rtmp_endpoint>
+# Usage:
+#   pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] <media_url> <rtmp_endpoint>
 # Examples:
 #   pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 #   pipr --force-encoding --encoder libx264 --bitrate 4500k --preset veryfast "https://www.twitch.tv/<channel>" "rtmp://your-endpoint/live/key"
@@ -50,45 +51,79 @@ mask_rtmp() {
   fi
 }
 
-################################
-# Flags, Arguments and Defaults #
-################################
+# Sanitize tool stderr by masking RTMP endpoints and reducing HTTP(S) URLs to host-only
+filter_stderr() {
+  while IFS= read -r line; do
+    local out="$line"
+    while read -r url; do
+      [[ -z "$url" ]] && continue
+      if [[ "$url" =~ ^rtmps?:// ]]; then
+        local masked
+        masked="$(mask_rtmp "$url")"
+        out=${out//"$url"/"$masked"}
+      elif [[ "$url" =~ ^https?:// ]]; then
+        local proto host masked
+        proto="${url%%://*}"
+        host="$(host_from_url "$url")"
+        masked="${proto}://${host}/..."
+        out=${out//"$url"/"$masked"}
+      fi
+    done < <(grep -Eo '(rtmps?|https?)://[^ ]+' <<<"$line" || true)
+    echo "$out"
+  done
+}
+
+###############################
+# Flags, Arguments and Defaults#
+###############################
 VERBOSE=0
 FORCE_ENCODING=0
 ENCODER="libx264"
 VBITRATE=""
 PRESET="veryfast"
 
+print_help() {
+  cat <<EOF
+Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] <media_url> <rtmp_endpoint>
+
+Options:
+  -v                     Verbose mode; mirror yt-dlp/ffmpeg output to terminal and log.
+  --force-encoding       Skip stream copy and start with re-encoding.
+  --encoder <name>       Video encoder for re-encode (default: libx264). Examples: libx264, h264_nvenc, hevc_videotoolbox.
+  --bitrate <vbitrate>   Video bitrate for re-encode (e.g., 4500k). Default: encoder default.
+  --preset <preset>      Encoder preset (default: veryfast). Examples: veryfast, fast, medium.
+  -h, --help             Show this help and exit.
+
+Notes:
+- Copy is attempted first unless --force-encoding is set. If copy fails, re-encoding is used with the above settings.
+- Logs sanitize RTMP endpoints and reduce HTTP(S) URLs to host-only, but be cautious if sharing logs.
+EOF
+}
+
 # Simple long-option parser
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -v)
-      VERBOSE=1; shift
-      ;;
+      VERBOSE=1; shift ;;  
     --force-encoding)
-      FORCE_ENCODING=1; shift
-      ;;
+      FORCE_ENCODING=1; shift ;;  
     --encoder)
-      [[ -n "${2-}" ]] || err "Missing value for $1"
-      ENCODER="$2"; shift 2
-      ;;
+      [[ -n "
+${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;;  
     --bitrate|--vb|--video-bitrate)
-      [[ -n "${2-}" ]] || err "Missing value for $1"
-      VBITRATE="$2"; shift 2
-      ;;
+      [[ -n "
+${2-}" ]] || err "Missing value for $1"; VBITRATE="$2"; shift 2 ;;  
     --preset)
-      [[ -n "${2-}" ]] || err "Missing value for $1"
-      PRESET="$2"; shift 2
-      ;;
+      [[ -n "
+${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;;  
+    -h|--help)
+      print_help; exit 0 ;;  
     --)
-      shift; break
-      ;;
+      shift; break ;;  
     -* )
-      err "Unknown option: $1"
-      ;;
+      err "Unknown option: $1" ;;  
     *)
-      break
-      ;;
+      break ;;  
   esac
 done
 
@@ -96,7 +131,7 @@ STREAM_URL="${1-}"
 RTMP_ENDPOINT="${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
-  err "Usage: $0 [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] <media_url> <rtmp_endpoint>"
+  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] <media_url> <rtmp_endpoint>"
 fi
 
 for cmd in yt-dlp ffmpeg; do
@@ -108,7 +143,7 @@ done
 ###################################
 # Identify source domain for log  #
 ###################################
-DOMAIN="$(host_from_url "${STREAM_URL}")"
+DOMAIN="$(host_from_url "$STREAM_URL")"
 log "[pipr] Source domain detected: $DOMAIN"
 
 if [[ $FORCE_ENCODING -eq 1 ]]; then
@@ -116,61 +151,78 @@ if [[ $FORCE_ENCODING -eq 1 ]]; then
 fi
 log "[pipr] Encoding settings: encoder=$ENCODER preset=$PRESET bitrate=${VBITRATE:-default}"
 
-#####################
+#######################
 # Get direct URL    #
-#####################
+#######################
 log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
+YTDLP_FORMAT='bestvideo*+bestaudio/best'
 if [[ $VERBOSE -eq 1 ]]; then
-  MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL" 2> >(tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
 else
-  MEDIA_URL=$(yt-dlp --no-playlist --get-url -f "best" "$STREAM_URL" 2>>"$LOGFILE") || err "[pipr] yt-dlp failed to get stream URL"
+  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
 fi
 
-MEDIA_HOST="$(host_from_url "$MEDIA_URL")"
-MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
+if [[ ${#MEDIA_URLS[@]} -eq 0 ]]; then
+  err "[pipr] No media URLs returned by yt-dlp"
+fi
 
+MEDIA_HOST="$(host_from_url "${MEDIA_URLS[0]}")"
+MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
 log "[pipr] Resolved media host: $MEDIA_HOST"
 log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 
 #########################################
+# Build input args (multi-URL handling) #
+#########################################
+FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration 20M -probesize 100M -re)
+MAP_ARGS=()
+# Append per-input reconnect flags (for HTTP/S) and -i
+for idx in "${!MEDIA_URLS[@]}"; do
+  url="${MEDIA_URLS[$idx]}"
+  if [[ "$url" =~ ^https?:// ]]; then
+    FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
+  fi
+  FFMPEG_INPUT_ARGS+=( -i "$url" )
+  # Build stream mapping if we have 2 inputs (0=video, 1=audio)
+  if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
+    if [[ $idx -eq 0 ]]; then MAP_ARGS+=( -map 0:v:0 ); fi
+    if [[ $idx -eq 1 ]]; then MAP_ARGS+=( -map 1:a:0 ); fi
+  fi
+done
+
+#########################################
 # Streaming with ffmpeg + error fallback#
 #########################################
-# Build encode command (optionally include bitrate)
-encode_cmd_common=(-hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" -c:v "$ENCODER" -preset "$PRESET" -c:a aac -f flv "$RTMP_ENDPOINT")
-if [[ -n "$VBITRATE" ]]; then
-  encode_cmd_common=(-hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" -c:v "$ENCODER" -preset "$PRESET" -b:v "$VBITRATE" -c:a aac -f flv "$RTMP_ENDPOINT")
-fi
-
 run_ffmpeg_copy() {
+  set +e
   if [[ $VERBOSE -eq 1 ]]; then
-    set +e; set -o pipefail
-    ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" -c copy -f flv "$RTMP_ENDPOINT" 2> >(tee -a "$LOGFILE" >&2)
-    local exit_code=${PIPESTATUS[0]}
-    set +o pipefail; set -e
-    return $exit_code
+    ffmpeg ${FFMPEG_INPUT_ARGS[@]} -c copy ${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
   else
-    set +e
-    ffmpeg -hide_banner -analyzeduration 20M -probesize 100M -re -i "$MEDIA_URL" -c copy -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2>&1
-    local exit_code=$?
-    set -e
-    return $exit_code
+    ffmpeg ${FFMPEG_INPUT_ARGS[@]} -c copy ${MAP_ARGS[@]} -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
   fi
+  local exit_code=$?
+  set -e
+  return $exit_code
 }
 
 run_ffmpeg_encode() {
-  if [[ $VERBOSE -eq 1 ]]; then
-    set +e; set -o pipefail
-    ffmpeg "${encode_cmd_common[@]}" 2> >(tee -a "$LOGFILE" >&2)
-    local exit_code=${PIPESTATUS[0]}
-    set +o pipefail; set -e
-    return $exit_code
+  set +e
+  if [[ -n "$VBITRATE" ]]; then
+    if [[ $VERBOSE -eq 1 ]]; then
+      ffmpeg ${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -b:v "$VBITRATE" -c:a aac -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    else
+      ffmpeg ${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -b:v "$VBITRATE" -c:a aac -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    fi
   else
-    set +e
-    ffmpeg "${encode_cmd_common[@]}" >>"$LOGFILE" 2>&1
-    local exit_code=$?
-    set -e
-    return $exit_code
+    if [[ $VERBOSE -eq 1 ]]; then
+      ffmpeg ${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    else
+      ffmpeg ${FFMPEG_INPUT_ARGS[@]} ${MAP_ARGS[@]} -c:v "$ENCODER" -preset "$PRESET" -c:a aac -f flv "$RTMP_ENDPOINT" >>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    fi
   fi
+  local exit_code=$?
+  set -e
+  return $exit_code
 }
 
 if [[ $FORCE_ENCODING -eq 1 ]]; then
@@ -194,4 +246,4 @@ if run_ffmpeg_encode; then
   log "[pipr] Stream succeeded after re-encoding."
 else
   err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
-}
+fi
