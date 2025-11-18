@@ -27,8 +27,7 @@ host_from_url() {
   # Prints only the host of a URL (scheme-agnostic)
   # Example: https://example.com/path?a=b -> example.com
   local url="$1"
-  echo "$url" | sed -E 's_https?://([^/]+).*_
-  1_' | tr -d '\n'
+  echo "$url" | sed -E 's~https?://([^/]+).*~\1~' | tr -d '\n'
 }
 
 mask_rtmp() {
@@ -57,7 +56,7 @@ mask_rtmp() {
 VERBOSE=0
 FORCE_ENCODING=0
 ENCODER="libx264"
-vBITRATE=""
+VBITRATE=""
 PRESET="veryfast"
 
 # Simple long-option parser
@@ -70,8 +69,7 @@ while [[ $# -gt 0 ]]; do
       FORCE_ENCODING=1; shift
       ;;
     --encoder)
-      [[ -n "
-  2-" ]] || err "Missing value for $1"
+      [[ -n "${2-}" ]] || err "Missing value for $1"
       ENCODER="$2"; shift 2
       ;;
     --bitrate|--vb|--video-bitrate)
