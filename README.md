@@ -102,6 +102,34 @@ Notes on precedence
 - Verbose (`-v`): `yt-dlp` and `ffmpeg` output is mirrored to terminal and logged.
 - Sanitization: `pipr` masks RTMP endpoints (e.g., `rtmp://server/app/***abcd`) and reduces HTTP(S) URLs to `protocol://host/...` in logged/echoed tool output. Review logs before sharing.
 
+## Production defaults
+
+For enhanced reliability and compatibility, `pipr` applies these defaults automatically:
+
+- **Conditional `-re` usage**: The `-re` (real-time) flag is applied only to non-HTTP(S) inputs (local files) to reduce latency for live HTTP/HLS streams.
+- **HTTP(S) resilience**: HTTP(S) inputs automatically include:
+  - `-rw_timeout 15000000` (15-second socket timeout)
+  - `-http_persistent 0` (disables persistent connections for better reconnection)
+  - Reconnect flags (`-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5`)
+- **Encoding compatibility**: When re-encoding (copy fallback or `--force-encoding`):
+  - `-pix_fmt yuv420p` ensures broad player compatibility
+  - `-ac 2` outputs stereo audio
+  - When `--bitrate` is set, `-maxrate` and `-bufsize` are automatically added to stabilize rate control
+- **CFR keyframe alignment**: When using `--keyframe-interval` in seconds (e.g., `2s`) combined with `--fps`:
+  - Output frame rate is set (`-r <fps>`)
+  - Constant frame rate is enforced (`-vsync cfr`)
+  - GOP size is computed as `round(seconds * fps)` for predictable spacing
+
+Example with CFR and 2-second keyframes at 60fps:
+```bash
+pipr --force-encoding --encoder libx264 --bitrate 6000k --preset fast \
+     --keyframe-interval 2s --fps 60 \
+     "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
+# Results in: -g 120 -r 60 -vsync cfr -force_key_frames "expr:gte(t,n_forced*2)"
+```
+
+These defaults require no CLI changes and are applied automatically for production hardening.
+
 ## 💸 Support pipr
 
 This project is free and open source. If you'd like to support pipr and tip the developer, you can donate via:
