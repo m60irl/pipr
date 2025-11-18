@@ -35,6 +35,7 @@ handle_error() {
   local exit_code=$?
   local line_no=$1
   log "ERROR: Command failed at line $line_no with exit code $exit_code"
+  exit "$exit_code"
 }
 
 handle_shutdown() {
@@ -90,7 +91,12 @@ filter_stderr() {
       [[ -z "$token" ]] && continue
       local url="$token"
       # Trim common trailing punctuation and quotes from token to get the raw URL
-      while [[ "$url" =~ [",)\]>.;:'"]$ ]]; do url="${url%?}"; done
+      while :; do
+        case "$url" in
+          *[\"\']|*\)|*\]|*\>|*.|*\;|*:|*,) url="${url%?}" ;;
+          *) break ;;
+        esac
+      done
       [[ -z "$url" ]] && continue
       local replacement=""
       if [[ "$url" =~ ^rtmps?:// ]]; then
