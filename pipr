@@ -20,8 +20,13 @@ set -euo pipefail -E
 # Logging Functions #
 #####################
 LOGFILE="pipr.log"
+ENABLE_LOGFILE=1
 log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
+  if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
+  else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
+  fi
 }
 err() {
   log "ERROR: $*"
@@ -125,6 +130,31 @@ filter_stderr() {
   done
 }
 
+# Check if ffmpeg supports http_persistent flag
+supports_http_persistent() {
+  if ffmpeg -h protocol=http 2>&1 | grep -q "http_persistent"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Parse bitrate string (e.g., 4500k, 5M) to numeric value in kbps
+parse_bitrate() {
+  local br="$1"
+  if [[ "$br" =~ ^([0-9]+)([kKmM]?)$ ]]; then
+    local num="${BASH_REMATCH[1]}"
+    local suffix="${BASH_REMATCH[2]}"
+    case "${suffix,,}" in
+      k) echo "$num" ;;
+      m) echo "$((num * 1000))" ;;
+      "") echo "$num" ;;
+    esac
+  else
+    echo ""
+  fi
+}
+
 ###############################
 # Flags, Arguments and Defaults#
 ###############################
@@ -141,13 +171,17 @@ FPS=""        # optional, used to align -g with seconds-based keyframe interval
 ANALYZEDURATION="20M"
 PROBESIZE="100M"
 
+# New flags
+REALTIME=0
+PROPAGATE_HEADERS=0
+
 # yt-dlp pass-through support
 YTDLP_ARGS=()
 YTDLP_FORMAT='bestvideo*+bestaudio/best'
 
 print_help() {
   cat <<EOF
-Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
+Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--realtime] [--propagate-headers] [--log-file <path>] [--no-log-file] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
 
 Options:
   -v                         Verbose mode; mirror yt-dlp/ffmpeg output to terminal and log.
@@ -162,6 +196,10 @@ Options:
   --fps <rate>               When using a seconds-based interval, also set -g = seconds*fps for encoders that prefer it.
   --analyzeduration <value>  ffmpeg analyzeduration (default: 20M).
   --probesize <value>        ffmpeg probesize (default: 100M).
+  --realtime                 Apply real-time pacing (-re) to HTTP/HTTPS inputs for VOD-to-RTMP streaming.
+  --propagate-headers        Fetch and forward yt-dlp HTTP headers to ffmpeg (requires jq).
+  --log-file <path>          Override default log file path (default: pipr.log).
+  --no-log-file              Disable file logging; output only to terminal.
   --ytdlp-format <fmt>       yt-dlp format selector (default: bestvideo*+bestaudio/best).
   --ytdlp-arg <arg>          Additional yt-dlp argument (repeatable). Example: --ytdlp-arg "--cookies cookies.txt"
   -h, --help                 Show this help and exit.
@@ -189,6 +227,10 @@ while [[ $# -gt 0 ]]; do
     --probesize) [[ -n "${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;;
     --ytdlp-arg) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_ARGS+=( "$2" ); shift 2 ;;
     --ytdlp-format) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_FORMAT="$2"; shift 2 ;;
+    --realtime) REALTIME=1; shift ;;
+    --propagate-headers) PROPAGATE_HEADERS=1; shift ;;
+    --log-file) [[ -n "${2-}" ]] || err "Missing value for $1"; LOGFILE="$2"; shift 2 ;;
+    --no-log-file) ENABLE_LOGFILE=0; shift ;;
     -h|--help) print_help; exit 0 ;;
     --) shift; break ;;
     -*) err "Unknown option: $1" ;;
@@ -210,6 +252,26 @@ for cmd in yt-dlp ffmpeg; do
 done
 
 ###################################
+# Preflight: Log tool versions     #
+###################################
+log "[pipr] Tool versions:"
+if command -v yt-dlp &>/dev/null; then
+  YTDLP_VER=$(yt-dlp --version 2>/dev/null || echo "unknown")
+  log "[pipr]   yt-dlp: $YTDLP_VER"
+fi
+if command -v ffmpeg &>/dev/null; then
+  FFMPEG_VER=$(ffmpeg -version 2>/dev/null | head -n1 || echo "unknown")
+  log "[pipr]   ffmpeg: $FFMPEG_VER"
+fi
+
+# Check rtmps support if endpoint uses rtmps://
+if [[ "$RTMP_ENDPOINT" =~ ^rtmps:// ]]; then
+  if ! ffmpeg -hide_banner -protocols 2>&1 | grep -qw "rtmps"; then
+    log "[pipr] WARNING: RTMP endpoint uses rtmps:// but ffmpeg does not list 'rtmps' in supported protocols. This may fail. Consider using an ffmpeg build with TLS support."
+  fi
+fi
+
+###################################
 # Identify source domain for log  #
 ###################################
 DOMAIN="$(host_from_url "$STREAM_URL")"
@@ -227,23 +289,43 @@ log "[pipr] Buffering: analyzeduration=$ANALYZEDURATION probesize=$PROBESIZE"
 log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
 if [[ $VERBOSE -eq 1 ]]; then
   if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
-    mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+    else
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+    fi
   else
     # Bash 3.2 fallback: use while read loop with process substitution
     MEDIA_URLS=()
     while IFS= read -r line; do
       MEDIA_URLS+=("$line")
-    done < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+    done < <(
+      if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+        yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+      else
+        yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >&2)
+      fi
+    ) || err "[pipr] yt-dlp failed to get stream URL"
   fi
 else
   if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
-    mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+    else
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null) || err "[pipr] yt-dlp failed to get stream URL"
+    fi
   else
     # Bash 3.2 fallback: use while read loop with process substitution
     MEDIA_URLS=()
     while IFS= read -r line; do
       MEDIA_URLS+=("$line")
-    done < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+    done < <(
+      if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+        yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")
+      else
+        yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null
+      fi
+    ) || err "[pipr] yt-dlp failed to get stream URL"
   fi
 fi
 
@@ -257,27 +339,91 @@ log "[pipr] Resolved media host: $MEDIA_HOST"
 log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
 
 #########################################
+# Optional: Propagate HTTP headers      #
+#########################################
+declare -A HTTP_HEADERS_ARGS
+if [[ $PROPAGATE_HEADERS -eq 1 ]]; then
+  if ! command -v jq &>/dev/null; then
+    log "[pipr] WARNING: --propagate-headers requires jq, but jq is not installed. Skipping header propagation."
+  else
+    log "[pipr] Fetching HTTP headers from yt-dlp..."
+    JSON_OUTPUT=$(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --dump-json -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null || echo "{}")
+    if [[ -n "$JSON_OUTPUT" && "$JSON_OUTPUT" != "{}" ]]; then
+      # Extract http_headers if present
+      USER_AGENT=$(echo "$JSON_OUTPUT" | jq -r '.http_headers["User-Agent"] // empty' 2>/dev/null || echo "")
+      REFERER=$(echo "$JSON_OUTPUT" | jq -r '.http_headers["Referer"] // empty' 2>/dev/null || echo "")
+      OTHER_HEADERS=$(echo "$JSON_OUTPUT" | jq -r '.http_headers | to_entries | map(select(.key != "User-Agent" and .key != "Referer")) | map("\(.key): \(.value)") | join("\r\n")' 2>/dev/null || echo "")
+      
+      # Build header args per URL (we'll apply them to HTTP(S) inputs)
+      for idx in "${!MEDIA_URLS[@]}"; do
+        url="${MEDIA_URLS[$idx]}"
+        if [[ "$url" =~ ^https?:// ]]; then
+          local hargs=()
+          if [[ -n "$USER_AGENT" ]]; then
+            hargs+=( -user_agent "$USER_AGENT" )
+          fi
+          if [[ -n "$REFERER" ]]; then
+            hargs+=( -referer "$REFERER" )
+          fi
+          if [[ -n "$OTHER_HEADERS" ]]; then
+            hargs+=( -headers "${OTHER_HEADERS}"$'\r\n' )
+          fi
+          if [[ ${#hargs[@]} -gt 0 ]]; then
+            HTTP_HEADERS_ARGS[$idx]="${hargs[*]}"
+            log "[pipr] Propagated headers for input $idx"
+          fi
+        fi
+      done
+    else
+      log "[pipr] WARNING: Could not fetch JSON metadata from yt-dlp. Skipping header propagation."
+    fi
+  fi
+fi
+
+#########################################
 # Build input args (multi-URL handling) #
 #########################################
+# Build shared HTTP network flags       #
+#########################################
+HTTP_NET_FLAGS=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 )
+if [[ $(supports_http_persistent) -eq 1 ]]; then
+  HTTP_NET_FLAGS+=( -http_persistent 0 )
+fi
+
 FFMPEG_INPUT_ARGS=(-hide_banner -analyzeduration "$ANALYZEDURATION" -probesize "$PROBESIZE")
 MAP_ARGS=()
-# Append per-input reconnect flags (for HTTP/S) and -i
+# Append per-input flags and -i
 for idx in "${!MEDIA_URLS[@]}"; do
   url="${MEDIA_URLS[$idx]}"
   if [[ "$url" =~ ^https?:// ]]; then
     # HTTP/S input: add network resilience flags
-    FFMPEG_INPUT_ARGS+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 -http_persistent 0 )
+    FFMPEG_INPUT_ARGS+=( "${HTTP_NET_FLAGS[@]}" )
+    # Add real-time pacing if requested
+    if [[ $REALTIME -eq 1 ]]; then
+      FFMPEG_INPUT_ARGS+=( -re )
+    fi
+    # Add propagated headers if available
+    if [[ -n "${HTTP_HEADERS_ARGS[$idx]:-}" ]]; then
+      read -ra hargs_array <<< "${HTTP_HEADERS_ARGS[$idx]}"
+      FFMPEG_INPUT_ARGS+=( "${hargs_array[@]}" )
+    fi
   else
     # Non-HTTP input: apply -re to throttle reading
     FFMPEG_INPUT_ARGS+=( -re )
   fi
+  # Add thread queue size before input
+  FFMPEG_INPUT_ARGS+=( -thread_queue_size 1024 )
   FFMPEG_INPUT_ARGS+=( -i "$url" )
-  # Build stream mapping if we have 2 inputs (0=video, 1=audio)
-  if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
-    if [[ $idx -eq 0 ]]; then MAP_ARGS+=( -map 0:v:0 ); fi
-    if [[ $idx -eq 1 ]]; then MAP_ARGS+=( -map 1:a:0 ); fi
-  fi
 done
+
+# Build stream mapping
+if [[ ${#MEDIA_URLS[@]} -eq 1 ]]; then
+  # Single input: map video and audio explicitly with optional audio
+  MAP_ARGS+=( -map 0:v:0 -map 0:a:0? )
+elif [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
+  # Multi-input: map video from first, audio from second
+  MAP_ARGS+=( -map 0:v:0 -map 1:a:0 )
+fi
 
 #########################################
 # Streaming with ffmpeg + error fallback#
@@ -285,9 +431,17 @@ done
 run_ffmpeg_copy() {
   set +e
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
+    fi
   else
-    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
+    fi
   fi
   local exit_code=$?
   set -e
@@ -299,12 +453,31 @@ run_ffmpeg_encode() {
   local extra=()
   # Compatibility defaults for RTMP/FLV
   extra+=( -pix_fmt yuv420p -ac 2 )
-  # Bitrate and audio tuning
+  
+  # Bitrate and audio tuning with improved rate control
   if [[ -n "$VBITRATE" ]]; then
-    extra+=( -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "$VBITRATE" )
+    local bitrate_kbps
+    bitrate_kbps=$(parse_bitrate "$VBITRATE")
+    if [[ -n "$bitrate_kbps" ]]; then
+      # Compute maxrate = 1.07 * bitrate, bufsize = 2 * bitrate
+      local maxrate_kbps=$((bitrate_kbps * 107 / 100))
+      local bufsize_kbps=$((bitrate_kbps * 2))
+      extra+=( -b:v "${bitrate_kbps}k" -maxrate "${maxrate_kbps}k" -bufsize "${bufsize_kbps}k" )
+    else
+      # Fallback to old behavior if parsing fails
+      extra+=( -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "$VBITRATE" )
+    fi
   fi
   if [[ -n "$ABITRATE" ]]; then extra+=( -b:a "$ABITRATE" ); fi
   if [[ -n "$ARATE" ]]; then extra+=( -ar "$ARATE" ); fi
+  
+  # Encoder-specific tuning
+  if [[ "$ENCODER" == "libx264" ]]; then
+    extra+=( -profile:v high -tune zerolatency )
+  elif [[ "$ENCODER" =~ nvenc ]]; then
+    extra+=( -rc cbr -forced-idr 1 )
+  fi
+  
   # GOP / keyframe interval
   if [[ -n "$KEYINT" ]]; then
     local val="$KEYINT"
@@ -312,26 +485,55 @@ run_ffmpeg_encode() {
       local sec="${val%s}"
       extra+=( -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*${sec})" )
       if [[ -n "$FPS" && "$FPS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        # Compute frames = round(sec * fps) using awk
-        local gframes
-        gframes=$(awk -v s="$sec" -v f="$FPS" 'BEGIN{printf "%d", s*f + 0.5}')
-        if [[ "$gframes" -gt 0 ]]; then
+        # Compute frames = round(sec * fps)
+        local gframes=""
+        if command -v awk &>/dev/null; then
+          gframes=$(awk -v s="$sec" -v f="$FPS" 'BEGIN{printf "%d", s*f + 0.5}')
+        else
+          # Fallback: shell arithmetic for integer values only
+          if [[ "$sec" =~ ^[0-9]+$ && "$FPS" =~ ^[0-9]+$ ]]; then
+            gframes=$((sec * FPS))
+          else
+            log "[pipr] Warning: awk not found and values not integers; skipping -g computation"
+          fi
+        fi
+        if [[ -n "$gframes" && "$gframes" -gt 0 ]]; then
           extra+=( -g "$gframes" -r "$FPS" -vsync cfr )
+          # For libx264, add scenecut=0 to reinforce no scene-cut keyframes
+          if [[ "$ENCODER" == "libx264" ]]; then
+            extra+=( -x264-params "scenecut=0" )
+          fi
         fi
       fi
     elif [[ "$val" =~ ^[0-9]+$ ]]; then
       extra+=( -g "$val" -sc_threshold 0 )
+      # For libx264 with frame-based GOP, add scenecut=0
+      if [[ "$ENCODER" == "libx264" ]]; then
+        extra+=( -x264-params "scenecut=0" )
+      fi
     else
       log "[pipr] Warning: invalid --keyframe-interval value '$val'; ignoring"
     fi
   elif [[ -n "$GOP" ]]; then
     extra+=( -g "$GOP" -sc_threshold 0 )
+    # For libx264 with frame-based GOP, add scenecut=0
+    if [[ "$ENCODER" == "libx264" ]]; then
+      extra+=( -x264-params "scenecut=0" )
+    fi
   fi
 
   if [[ $VERBOSE -eq 1 ]]; then
-    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
+    fi
   else
-    ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
+    fi
   fi
   local exit_code=$?
   set -e
