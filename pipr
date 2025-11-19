@@ -20,7 +20,7 @@ set -euo pipefail -E
 # Logging Functions #
 #####################
 LOGFILE="pipr.log"
-ENABLE_LOGFILE=1
+ENABLE_LOGFILE=0
 log() {
   if [[ $ENABLE_LOGFILE -eq 1 ]]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
@@ -181,10 +181,10 @@ YTDLP_FORMAT='bestvideo*+bestaudio/best'
 
 print_help() {
   cat <<EOF
-Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--realtime] [--propagate-headers] [--log-file <path>] [--no-log-file] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
+Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--realtime] [--propagate-headers] [--log-file [<path>]] [--no-log-file] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
 
 Options:
-  -v                         Verbose mode; mirror yt-dlp/ffmpeg output to terminal and log.
+  -v                         Verbose mode; show ffmpeg progress and mirror yt-dlp/ffmpeg output to terminal (and log if enabled).
   --force-encoding           Skip stream copy and start with re-encoding.
   --encoder <name>           Video encoder for re-encode (default: libx264). Examples: libx264, h264_nvenc, hevc_videotoolbox.
   --bitrate <vbitrate>       Video bitrate for re-encode (e.g., 4500k). Default: encoder default.
@@ -198,13 +198,15 @@ Options:
   --probesize <value>        ffmpeg probesize (default: 100M).
   --realtime                 Apply real-time pacing (-re) to HTTP/HTTPS inputs for VOD-to-RTMP streaming.
   --propagate-headers        Fetch and forward yt-dlp HTTP headers to ffmpeg (requires jq).
-  --log-file <path>          Override default log file path (default: pipr.log).
-  --no-log-file              Disable file logging; output only to terminal.
+  --log-file [<path>]        Enable file logging. Optionally specify a log file path (default: pipr.log when enabled).
+  --no-log-file              Explicitly disable file logging (default behavior).
   --ytdlp-format <fmt>       yt-dlp format selector (default: bestvideo*+bestaudio/best).
   --ytdlp-arg <arg>          Additional yt-dlp argument (repeatable). Example: --ytdlp-arg "--cookies cookies.txt"
   -h, --help                 Show this help and exit.
 
 Notes:
+- File logging is OFF by default. Use --log-file to enable and optionally specify a path.
+- By default (no -v), ffmpeg runs quietly (errors only). Use -v to see progress.
 - Copy is attempted first unless --force-encoding is set. If copy fails, re-encoding is used with the above settings.
 - Logs sanitize RTMP endpoints and reduce HTTP(S) URLs to host-only, but be cautious if sharing logs.
 EOF
@@ -229,7 +231,15 @@ while [[ $# -gt 0 ]]; do
     --ytdlp-format) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_FORMAT="$2"; shift 2 ;;
     --realtime) REALTIME=1; shift ;;
     --propagate-headers) PROPAGATE_HEADERS=1; shift ;;
-    --log-file) [[ -n "${2-}" ]] || err "Missing value for $1"; LOGFILE="$2"; shift 2 ;;
+    --log-file)
+      ENABLE_LOGFILE=1
+      if [[ -n "${2-}" && ! "$2" =~ ^- ]]; then
+        LOGFILE="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
     --no-log-file) ENABLE_LOGFILE=0; shift ;;
     -h|--help) print_help; exit 0 ;;
     --) shift; break ;;
@@ -242,7 +252,7 @@ STREAM_URL="${1-}"
 RTMP_ENDPOINT="${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
-  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] \"<source_url>\" \"<rtmp_endpoint>\""
+  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--log-file [<path>]] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] \"<source_url>\" \"<rtmp_endpoint>\""
 fi
 
 for cmd in yt-dlp ffmpeg; do
@@ -432,15 +442,15 @@ run_ffmpeg_copy() {
   set +e
   if [[ $VERBOSE -eq 1 ]]; then
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
     else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
     fi
   else
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
     else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
     fi
   fi
   local exit_code=$?
@@ -524,15 +534,15 @@ run_ffmpeg_encode() {
 
   if [[ $VERBOSE -eq 1 ]]; then
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
     else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
     fi
   else
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
     else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats "${MAP_ARGS[@]}" -c:v "$ENCODER" -preset "$PRESET" -c:a aac "${extra[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
     fi
   fi
   local exit_code=$?
@@ -546,7 +556,11 @@ if [[ $FORCE_ENCODING -eq 1 ]]; then
     log "[pipr] Stream succeeded with re-encoding."
     exit 0
   else
-    err "[pipr] ffmpeg failed with re-encoding. See $LOGFILE for details."
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      err "[pipr] ffmpeg failed with re-encoding. See $LOGFILE for details."
+    else
+      err "[pipr] ffmpeg failed with re-encoding. Run with -v to see error details."
+    fi
   fi
 fi
 
@@ -560,5 +574,9 @@ log "[pipr] Codec copy failed. Retrying with re-encoding ($ENCODER/aac)..."
 if run_ffmpeg_encode; then
   log "[pipr] Stream succeeded after re-encoding."
 else
-  err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
+  if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+    err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
+  else
+    err "[pipr] ffmpeg failed, even after re-encoding. Run with -v to see error details."
+  fi
 fi

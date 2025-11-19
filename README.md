@@ -56,7 +56,7 @@ Examples (adjust to your platform):
 # Basic usage (copy first, fallback to encode if needed):
 pipr "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 
-# Verbose mode (mirrors tool output to terminal and log; sanitized):
+# Verbose mode (shows ffmpeg progress in terminal; sanitized):
 pipr -v "https://kick.com/<channelname>" "rtmp://your-endpoint/live/stream_key"
 
 # Force re-encoding and tune video/audio:
@@ -77,12 +77,12 @@ pipr --realtime --force-encoding --encoder libx264 --bitrate 4500k \
 pipr --propagate-headers --force-encoding --encoder libx264 --bitrate 4500k \
      "https://www.example.com/video" "rtmp://your-endpoint/live/stream_key"
 
-# Custom log file location:
+# Enable file logging with custom location:
 pipr --log-file /tmp/my-stream.log \
      "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 
-# Disable file logging (terminal output only):
-pipr --no-log-file -v \
+# Enable file logging with default location (pipr.log):
+pipr --log-file \
      "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 
 # Keep buffering defaults explicitly (values are tunable, defaults preserved):
@@ -106,7 +106,7 @@ pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
 ## Flags
 
 - General
-  - `-v`: Verbose mode; mirrors yt-dlp/ffmpeg output to terminal and log.
+  - `-v`: Verbose mode; shows ffmpeg progress and mirrors yt-dlp/ffmpeg output to terminal (and log if file logging is enabled).
   - `--force-encoding`: Skip stream copy and start with re-encoding.
   - `--realtime`: Apply real-time pacing (`-re`) to HTTP/HTTPS inputs for VOD-to-RTMP streaming.
   - `--propagate-headers`: Fetch and forward yt-dlp HTTP headers to ffmpeg. Requires `jq`. If `jq` is not available, a warning is logged and execution continues without header propagation.
@@ -131,8 +131,8 @@ pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
   - `--probesize <value>`: ffmpeg probesize (default: `100M`).
 
 - Logging
-  - `--log-file <path>`: Override default log file path (default: `pipr.log`).
-  - `--no-log-file`: Disable file logging; terminal output still shows high-level pipr logs and (in `-v` mode) sanitized tool output.
+  - `--log-file [<path>]`: Enable file logging. Optionally specify a log file path (default: `pipr.log` when enabled). File logging is OFF by default.
+  - `--no-log-file`: Explicitly disable file logging (default behavior). Terminal output still shows high-level pipr logs and (in `-v` mode) sanitized tool output.
 
 - yt-dlp pass-through
   - `--ytdlp-format <fmt>`: Override yt-dlp format selector (default: `bestvideo*+bestaudio/best`).
@@ -242,9 +242,10 @@ When streaming pre-recorded videos (VOD) to RTMP:
 
 ## Logging and privacy
 
-- Default: Script log lines appear in terminal; raw tool output goes to `pipr.log`.
-- Verbose (`-v`): `yt-dlp` and `ffmpeg` output is mirrored to terminal and logged.
-- Sanitization: `pipr` masks RTMP endpoints (e.g., `rtmp://server/app/***abcd`) and reduces HTTP(S) URLs to `protocol://host/...` in logged/echoed tool output. Review logs before sharing.
+- **File logging is OFF by default.** Use `--log-file` to enable logging to a file.
+- **Default (no `-v`)**: pipr runs quietly with minimal output. High-level pipr log lines appear in terminal; ffmpeg shows errors only.
+- **Verbose (`-v`)**: ffmpeg progress stats are shown, and `yt-dlp`/`ffmpeg` output is mirrored to terminal (and to file if `--log-file` is used).
+- **Sanitization**: `pipr` masks RTMP endpoints (e.g., `rtmp://server/app/***abcd`) and reduces HTTP(S) URLs to `protocol://host/...` in logged/echoed tool output. Review logs before sharing.
 
 ## 💸 Support pipr
 
