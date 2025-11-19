@@ -548,7 +548,7 @@ if [[ $DRY_RUN -eq 1 || $FORCE_ENCODING -eq 0 ]]; then
   fi
   
   # Probe audio URL (second URL if separate, or first URL if single)
-  local audio_url="${MEDIA_URLS[0]}"
+  audio_url="${MEDIA_URLS[0]}"
   if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
     audio_url="${MEDIA_URLS[1]}"
   fi
@@ -586,8 +586,8 @@ if [[ $DRY_RUN -eq 1 || $FORCE_ENCODING -eq 0 ]]; then
     DECISION_REASON="probe failure fallback"
   else
     # Check codec compatibility
-    local video_ok=0
-    local audio_ok=0
+    video_ok=0
+    audio_ok=0
     
     if [[ "$PROBE_VIDEO_CODEC" =~ ^(h264|avc1)$ ]]; then
       video_ok=1
@@ -871,7 +871,7 @@ if run_ffmpeg_copy; then
 fi
 
 # Copy failed, log fallback with exit code
-local copy_exit_code=$?
+copy_exit_code=$?
 log "[pipr] Fallback: copy failed (exit=$copy_exit_code), switching to encode."
 
 log "[pipr] Retrying with re-encoding ($ENCODER/aac)..."
