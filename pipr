@@ -358,7 +358,7 @@ if [[ $PROPAGATE_HEADERS -eq 1 ]]; then
       for idx in "${!MEDIA_URLS[@]}"; do
         url="${MEDIA_URLS[$idx]}"
         if [[ "$url" =~ ^https?:// ]]; then
-          local hargs=()
+          hargs=()
           if [[ -n "$USER_AGENT" ]]; then
             hargs+=( -user_agent "$USER_AGENT" )
           fi
