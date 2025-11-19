@@ -16,12 +16,59 @@
 
 set -euo pipefail -E
 
+####################
+# Script Version   #
+####################
+VERSION="0.2.0"
+
+####################
+# Exit Codes       #
+####################
+EXIT_YTDLP_FAIL=10
+EXIT_NO_MEDIA_URLS=11
+EXIT_COPY_FAIL=20
+EXIT_ENCODE_FAIL=21
+EXIT_PROBE_FAIL=22
+EXIT_INVALID_ARGS=2
+
 #####################
 # Logging Functions #
 #####################
 LOGFILE="pipr.log"
 ENABLE_LOGFILE=0
+
+# Rotate log if it exceeds max size
+rotate_log_if_needed() {
+  if [[ $ENABLE_LOGFILE -eq 1 && -n "$LOG_MAX_SIZE" && -f "$LOGFILE" ]]; then
+    # Parse size (e.g., 10M, 5000k)
+    local max_bytes=0
+    if [[ "$LOG_MAX_SIZE" =~ ^([0-9]+)([kKmMgG]?)$ ]]; then
+      local num="${BASH_REMATCH[1]}"
+      local suffix="${BASH_REMATCH[2]}"
+      case "${suffix,,}" in
+        k) max_bytes=$((num * 1024)) ;;
+        m) max_bytes=$((num * 1024 * 1024)) ;;
+        g) max_bytes=$((num * 1024 * 1024 * 1024)) ;;
+        "") max_bytes=$num ;;
+      esac
+    fi
+    
+    if [[ $max_bytes -gt 0 ]]; then
+      local current_size
+      current_size=$(stat -f%z "$LOGFILE" 2>/dev/null || stat -c%s "$LOGFILE" 2>/dev/null || echo 0)
+      if [[ $current_size -ge $max_bytes ]]; then
+        # Rotate: keep last 3 logs
+        [[ -f "${LOGFILE}.2" ]] && rm -f "${LOGFILE}.2"
+        [[ -f "${LOGFILE}.1" ]] && mv "${LOGFILE}.1" "${LOGFILE}.2"
+        mv "$LOGFILE" "${LOGFILE}.1"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [pipr] Log rotated (size: ${current_size} bytes, max: ${max_bytes} bytes)" > "$LOGFILE"
+      fi
+    fi
+  fi
+}
+
 log() {
+  rotate_log_if_needed
   if [[ $ENABLE_LOGFILE -eq 1 ]]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE"
   else
@@ -29,8 +76,13 @@ log() {
   fi
 }
 err() {
+  local exit_code=1
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    exit_code="$1"
+    shift
+  fi
   log "ERROR: $*"
-  exit 1
+  exit "$exit_code"
 }
 
 #########################
@@ -139,6 +191,70 @@ supports_http_persistent() {
   fi
 }
 
+# Probe a media stream to extract codec and format info
+probe_stream() {
+  local url="$1"
+  local stream_type="${2:-v}"  # v for video, a for audio
+  
+  if ! command -v ffprobe &>/dev/null; then
+    echo "probe_failed=1"
+    return 1
+  fi
+  
+  local select_stream
+  if [[ "$stream_type" == "v" ]]; then
+    select_stream="v:0"
+  else
+    select_stream="a:0"
+  fi
+  
+  # Run ffprobe with error suppression
+  local probe_output
+  probe_output=$(ffprobe -v error -select_streams "$select_stream" \
+    -show_entries stream=codec_name,width,height,avg_frame_rate,bit_rate,channels,sample_rate \
+    -of default=noprint_wrappers=1 "$url" 2>/dev/null)
+  
+  if [[ -z "$probe_output" ]]; then
+    echo "probe_failed=1"
+    return 1
+  fi
+  
+  # Parse output into key=value format
+  local codec_name="" width="" height="" fps="" bitrate="" channels="" sample_rate=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      codec_name) codec_name="$value" ;;
+      width) width="$value" ;;
+      height) height="$value" ;;
+      avg_frame_rate) 
+        # Convert fraction to decimal (e.g., 30000/1001 -> 29.97)
+        if [[ "$value" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+          local num="${BASH_REMATCH[1]}"
+          local den="${BASH_REMATCH[2]}"
+          if command -v awk &>/dev/null; then
+            fps=$(awk -v n="$num" -v d="$den" 'BEGIN{printf "%.2f", n/d}')
+          else
+            fps="$value"
+          fi
+        else
+          fps="$value"
+        fi
+        ;;
+      bit_rate) bitrate="$value" ;;
+      channels) channels="$value" ;;
+      sample_rate) sample_rate="$value" ;;
+    esac
+  done <<< "$probe_output"
+  
+  # Return key=value pairs
+  if [[ "$stream_type" == "v" ]]; then
+    echo "codec=$codec_name width=$width height=$height fps=$fps bitrate=${bitrate:-unknown}"
+  else
+    echo "codec=$codec_name channels=$channels sample_rate=$sample_rate"
+  fi
+  return 0
+}
+
 # Parse bitrate string (e.g., 4500k, 5M) to numeric value in kbps
 parse_bitrate() {
   local br="$1"
@@ -159,6 +275,7 @@ parse_bitrate() {
 # Flags, Arguments and Defaults#
 ###############################
 VERBOSE=0
+DRY_RUN=0
 FORCE_ENCODING=0
 ENCODER="libx264"
 VBITRATE=""
@@ -170,6 +287,7 @@ KEYINT=""     # keyframe interval in seconds (e.g., 2s) or frames (e.g., 120)
 FPS=""        # optional, used to align -g with seconds-based keyframe interval
 ANALYZEDURATION="20M"
 PROBESIZE="100M"
+LOG_MAX_SIZE=""  # e.g., 10M for log rotation
 
 # New flags
 REALTIME=0
@@ -177,61 +295,96 @@ PROPAGATE_HEADERS=0
 
 # yt-dlp pass-through support
 YTDLP_ARGS=()
-YTDLP_FORMAT='bestvideo*+bestaudio/best'
+YTDLP_FORMAT=""  # Will be set to default if not provided by user
+DEFAULT_FORMAT='bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4][vcodec^=avc1]/best'
 
 print_help() {
   cat <<EOF
-Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--realtime] [--propagate-headers] [--log-file [<path>]] [--no-log-file] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] "<source_url>" "<rtmp_endpoint>"
+pipr v${VERSION} - Pipe any video/livestream to RTMP using yt-dlp and ffmpeg
 
-Options:
-  -v                         Verbose mode; show ffmpeg progress and mirror yt-dlp/ffmpeg output to terminal (and log if enabled).
-  --force-encoding           Skip stream copy and start with re-encoding.
-  --encoder <name>           Video encoder for re-encode (default: libx264). Examples: libx264, h264_nvenc, hevc_videotoolbox.
-  --bitrate <vbitrate>       Video bitrate for re-encode (e.g., 4500k). Default: encoder default.
+Usage:
+  pipr [OPTIONS] "<source_url>" "<rtmp_endpoint>"
+
+Core Flags:
+  -v, --verbose              Verbose mode; show ffmpeg progress and mirror tool output to terminal.
+  --dry-run                  Extract and probe media, print planned mode and commands, then exit without streaming.
+  --force-encoding           Skip stream copy attempt and start with re-encoding.
+
+Encoding Flags:
+  --encoder <name>           Video encoder for re-encode (default: libx264).
+                             Examples: libx264, h264_nvenc, hevc_videotoolbox.
+  --bitrate <vbitrate>       Video bitrate for re-encode (e.g., 4500k, 5M). Default: encoder default.
   --preset <preset>          Encoder preset (default: veryfast). Examples: veryfast, fast, medium.
   --audio-bitrate <abitrate> Audio bitrate (e.g., 128k, 160k). Default: encoder default.
   --audio-rate <arate>       Audio sample rate (e.g., 44100, 48k). Default: source/default.
-  --gop <frames>             GOP size (keyframe interval in frames). Applies -g <frames> and -sc_threshold 0.
   --keyframe-interval <v>    Keyframe interval in seconds (e.g., 2s) or frames (e.g., 120). Overrides --gop.
-  --fps <rate>               When using a seconds-based interval, also set -g = seconds*fps for encoders that prefer it.
+  --fps <rate>               When using seconds-based interval, also set -g = seconds*fps.
+  --gop <frames>             GOP size (keyframe interval in frames). Applies -g and -sc_threshold 0.
+
+Extraction Flags:
+  --ytdlp-format <fmt>       yt-dlp format selector.
+                             Default: bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4][vcodec^=avc1]/best
+  --ytdlp-arg <arg>          Additional yt-dlp argument (repeatable).
+                             Example: --ytdlp-arg "--cookies cookies.txt"
+
+Buffer/Network Flags:
   --analyzeduration <value>  ffmpeg analyzeduration (default: 20M).
   --probesize <value>        ffmpeg probesize (default: 100M).
   --realtime                 Apply real-time pacing (-re) to HTTP/HTTPS inputs for VOD-to-RTMP streaming.
   --propagate-headers        Fetch and forward yt-dlp HTTP headers to ffmpeg (requires jq).
-  --log-file [<path>]        Enable file logging. Optionally specify a log file path (default: pipr.log when enabled).
-  --no-log-file              Explicitly disable file logging (default behavior).
-  --ytdlp-format <fmt>       yt-dlp format selector (default: bestvideo*+bestaudio/best).
-  --ytdlp-arg <arg>          Additional yt-dlp argument (repeatable). Example: --ytdlp-arg "--cookies cookies.txt"
+
+Logging:
+  --log [<path>]             Enable file logging. Optionally specify log file path (default: pipr.log).
+  --log-max-size <size>      Max log size before rotation (e.g., 10M). Requires --log to be enabled.
+
+Misc:
   -h, --help                 Show this help and exit.
+  --version                  Show version and exit.
 
 Notes:
-- File logging is OFF by default. Use --log-file to enable and optionally specify a path.
-- By default (no -v), ffmpeg runs quietly (errors only). Use -v to see progress.
-- Copy is attempted first unless --force-encoding is set. If copy fails, re-encoding is used with the above settings.
-- Logs sanitize RTMP endpoints and reduce HTTP(S) URLs to host-only, but be cautious if sharing logs.
+  - File logging is OFF by default. Use --log to enable.
+  - By default (no -v), ffmpeg runs quietly (errors only). Use -v to see progress.
+  - Copy is attempted first unless --force-encoding or --dry-run is set.
+  - If copy fails, re-encoding is used with the above settings.
+  - Logs sanitize RTMP endpoints and reduce HTTP(S) URLs to host-only.
+
+Examples:
+  # Basic usage (copy first, fallback to encode):
+  pipr "https://www.youtube.com/watch?v=XXX" "rtmp://server/live/key"
+
+  # Dry run to see what would be done:
+  pipr --dry-run -v "https://www.youtube.com/watch?v=XXX" "rtmp://server/live/key"
+
+  # Force encoding with custom settings:
+  pipr --force-encoding --encoder libx264 --bitrate 4500k --preset fast \\
+       --keyframe-interval 2s --fps 60 "https://..." "rtmp://..."
+
+  # With logging and rotation:
+  pipr --log /tmp/stream.log --log-max-size 10M "https://..." "rtmp://..."
 EOF
 }
 
 # Simple long-option parser
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -v) VERBOSE=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --force-encoding) FORCE_ENCODING=1; shift ;;
-    --encoder) [[ -n "${2-}" ]] || err "Missing value for $1"; ENCODER="$2"; shift 2 ;;
-    --bitrate|--vb|--video-bitrate) [[ -n "${2-}" ]] || err "Missing value for $1"; VBITRATE="$2"; shift 2 ;;
-    --preset) [[ -n "${2-}" ]] || err "Missing value for $1"; PRESET="$2"; shift 2 ;;
-    --audio-bitrate|--ab) [[ -n "${2-}" ]] || err "Missing value for $1"; ABITRATE="$2"; shift 2 ;;
-    --audio-rate|--ar) [[ -n "${2-}" ]] || err "Missing value for $1"; ARATE="$2"; shift 2 ;;
-    --gop) [[ -n "${2-}" ]] || err "Missing value for $1"; GOP="$2"; shift 2 ;;
-    --keyframe-interval|--keyint) [[ -n "${2-}" ]] || err "Missing value for $1"; KEYINT="$2"; shift 2 ;;
-    --fps) [[ -n "${2-}" ]] || err "Missing value for $1"; FPS="$2"; shift 2 ;;
-    --analyzeduration) [[ -n "${2-}" ]] || err "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;;
-    --probesize) [[ -n "${2-}" ]] || err "Missing value for $1"; PROBESIZE="$2"; shift 2 ;;
-    --ytdlp-arg) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_ARGS+=( "$2" ); shift 2 ;;
-    --ytdlp-format) [[ -n "${2-}" ]] || err "Missing value for $1"; YTDLP_FORMAT="$2"; shift 2 ;;
+    --encoder) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; ENCODER="$2"; shift 2 ;;
+    --bitrate|--vb|--video-bitrate) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; VBITRATE="$2"; shift 2 ;;
+    --preset) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; PRESET="$2"; shift 2 ;;
+    --audio-bitrate|--ab) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; ABITRATE="$2"; shift 2 ;;
+    --audio-rate|--ar) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; ARATE="$2"; shift 2 ;;
+    --gop) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; GOP="$2"; shift 2 ;;
+    --keyframe-interval|--keyint) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; KEYINT="$2"; shift 2 ;;
+    --fps) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; FPS="$2"; shift 2 ;;
+    --analyzeduration) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; ANALYZEDURATION="$2"; shift 2 ;;
+    --probesize) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; PROBESIZE="$2"; shift 2 ;;
+    --ytdlp-arg) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; YTDLP_ARGS+=( "$2" ); shift 2 ;;
+    --ytdlp-format) [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"; YTDLP_FORMAT="$2"; shift 2 ;;
     --realtime) REALTIME=1; shift ;;
     --propagate-headers) PROPAGATE_HEADERS=1; shift ;;
-    --log-file)
+    --log-file|--log)
       ENABLE_LOGFILE=1
       if [[ -n "${2-}" && ! "$2" =~ ^- ]]; then
         LOGFILE="$2"
@@ -240,10 +393,16 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
+    --log-max-size)
+      [[ -n "${2-}" ]] || err "$EXIT_INVALID_ARGS" "Missing value for $1"
+      LOG_MAX_SIZE="$2"
+      shift 2
+      ;;
     --no-log-file) ENABLE_LOGFILE=0; shift ;;
     -h|--help) print_help; exit 0 ;;
+    --version) echo "pipr v${VERSION}"; exit 0 ;;
     --) shift; break ;;
-    -*) err "Unknown option: $1" ;;
+    -*) err "$EXIT_INVALID_ARGS" "Unknown option: $1" ;;
     *) break ;;
   esac
 done
@@ -252,12 +411,17 @@ STREAM_URL="${1-}"
 RTMP_ENDPOINT="${2-}"
 
 if [[ -z "$STREAM_URL" || -z "$RTMP_ENDPOINT" ]]; then
-  err "Usage: pipr [-v] [--force-encoding] [--encoder <name>] [--bitrate <vbitrate>] [--preset <preset>] [--audio-bitrate <abitrate>] [--audio-rate <arate>] [--gop <frames>] [--keyframe-interval <value>] [--fps <rate>] [--analyzeduration <value>] [--probesize <value>] [--log-file [<path>]] [--ytdlp-format <fmt>] [--ytdlp-arg <arg> ...] \"<source_url>\" \"<rtmp_endpoint>\""
+  err "$EXIT_INVALID_ARGS" "Missing required arguments. Run 'pipr --help' for usage."
+fi
+
+# Apply default format if user did not provide one
+if [[ -z "$YTDLP_FORMAT" ]]; then
+  YTDLP_FORMAT="$DEFAULT_FORMAT"
 fi
 
 for cmd in yt-dlp ffmpeg; do
   if ! command -v "$cmd" &>/dev/null; then
-    err "Required command '$cmd' not found. Please install it."
+    err "$EXIT_INVALID_ARGS" "Required command '$cmd' not found. Please install it."
   fi
 done
 
@@ -273,6 +437,8 @@ if command -v ffmpeg &>/dev/null; then
   FFMPEG_VER=$(ffmpeg -version 2>/dev/null | head -n1 || echo "unknown")
   log "[pipr]   ffmpeg: $FFMPEG_VER"
 fi
+
+log "[pipr] yt-dlp format string: $YTDLP_FORMAT"
 
 # Check rtmps support if endpoint uses rtmps://
 if [[ "$RTMP_ENDPOINT" =~ ^rtmps:// ]]; then
@@ -300,9 +466,9 @@ log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
 if [[ $VERBOSE -eq 1 ]]; then
   if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
     else
-      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >&2)) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
     fi
   else
     # Bash 3.2 fallback: use while read loop with process substitution
@@ -315,14 +481,14 @@ if [[ $VERBOSE -eq 1 ]]; then
       else
         yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >&2)
       fi
-    ) || err "[pipr] yt-dlp failed to get stream URL"
+    ) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
   fi
 else
   if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
     else
-      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null) || err "[pipr] yt-dlp failed to get stream URL"
+      mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
     fi
   else
     # Bash 3.2 fallback: use while read loop with process substitution
@@ -335,18 +501,122 @@ else
       else
         yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2>/dev/null
       fi
-    ) || err "[pipr] yt-dlp failed to get stream URL"
+    ) || err "$EXIT_YTDLP_FAIL" "[pipr] yt-dlp failed to get stream URL"
   fi
 fi
 
 if [[ ${#MEDIA_URLS[@]} -eq 0 ]]; then
-  err "[pipr] No media URLs returned by yt-dlp"
+  err "$EXIT_NO_MEDIA_URLS" "[pipr] No media URLs returned by yt-dlp"
 fi
 
 MEDIA_HOST="$(host_from_url "${MEDIA_URLS[0]}")"
 MASKED_RTMP="$(mask_rtmp "$RTMP_ENDPOINT")"
 log "[pipr] Resolved media host: $MEDIA_HOST"
 log "[pipr] Streaming to RTMP endpoint: $MASKED_RTMP"
+
+#########################################
+# Preflight ffprobe probing             #
+#########################################
+PROBE_VIDEO_CODEC=""
+PROBE_AUDIO_CODEC=""
+PROBE_FAILED=0
+SHOULD_COPY=0
+DECISION_REASON=""
+
+if [[ $DRY_RUN -eq 1 || $FORCE_ENCODING -eq 0 ]]; then
+  log "[pipr] Preflight probing media streams..."
+  
+  # Probe first video URL
+  if [[ ${#MEDIA_URLS[@]} -ge 1 ]]; then
+    probe_result=$(probe_stream "${MEDIA_URLS[0]}" "v" 2>/dev/null || echo "probe_failed=1")
+    if [[ "$probe_result" =~ probe_failed=1 ]]; then
+      PROBE_FAILED=1
+      log "[pipr] WARNING: ffprobe failed on video stream"
+    else
+      # Parse probe results
+      for field in $probe_result; do
+        if [[ "$field" =~ ^codec=(.+)$ ]]; then
+          PROBE_VIDEO_CODEC="${BASH_REMATCH[1]}"
+        fi
+      done
+      if [[ $VERBOSE -eq 1 ]]; then
+        log "[pipr] Video probe: $probe_result"
+      else
+        log "[pipr] Video codec: ${PROBE_VIDEO_CODEC:-unknown}"
+      fi
+    fi
+  fi
+  
+  # Probe audio URL (second URL if separate, or first URL if single)
+  local audio_url="${MEDIA_URLS[0]}"
+  if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
+    audio_url="${MEDIA_URLS[1]}"
+  fi
+  
+  probe_result=$(probe_stream "$audio_url" "a" 2>/dev/null || echo "probe_failed=1")
+  if [[ "$probe_result" =~ probe_failed=1 ]]; then
+    if [[ ${#MEDIA_URLS[@]} -ge 2 ]]; then
+      log "[pipr] WARNING: ffprobe failed on audio stream"
+    else
+      log "[pipr] No audio stream detected (video-only)"
+    fi
+  else
+    # Parse probe results
+    for field in $probe_result; do
+      if [[ "$field" =~ ^codec=(.+)$ ]]; then
+        PROBE_AUDIO_CODEC="${BASH_REMATCH[1]}"
+      fi
+    done
+    if [[ $VERBOSE -eq 1 ]]; then
+      log "[pipr] Audio probe: $probe_result"
+    else
+      log "[pipr] Audio codec: ${PROBE_AUDIO_CODEC:-unknown}"
+    fi
+  fi
+  
+  # Decide copy viability
+  if [[ $FORCE_ENCODING -eq 1 ]]; then
+    SHOULD_COPY=0
+    DECISION_REASON="forced encoding flag"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    SHOULD_COPY=0
+    DECISION_REASON="dry-run mode"
+  elif [[ $PROBE_FAILED -eq 1 ]]; then
+    SHOULD_COPY=1  # Attempt copy on probe failure (legacy behavior)
+    DECISION_REASON="probe failure fallback"
+  else
+    # Check codec compatibility
+    local video_ok=0
+    local audio_ok=0
+    
+    if [[ "$PROBE_VIDEO_CODEC" =~ ^(h264|avc1)$ ]]; then
+      video_ok=1
+    fi
+    
+    if [[ "$PROBE_AUDIO_CODEC" =~ ^(aac|mp4a)$ ]] || [[ -z "$PROBE_AUDIO_CODEC" ]]; then
+      audio_ok=1
+    fi
+    
+    if [[ $video_ok -eq 1 && $audio_ok -eq 1 ]]; then
+      SHOULD_COPY=1
+      DECISION_REASON="video=${PROBE_VIDEO_CODEC:-unknown}, audio=${PROBE_AUDIO_CODEC:-none}"
+    else
+      SHOULD_COPY=0
+      if [[ $video_ok -eq 0 ]]; then
+        DECISION_REASON="video codec=${PROBE_VIDEO_CODEC} not RTMP-compatible"
+      elif [[ $audio_ok -eq 0 ]]; then
+        DECISION_REASON="audio codec=${PROBE_AUDIO_CODEC} not RTMP-compatible"
+      fi
+    fi
+  fi
+  
+  # Log decision
+  if [[ $SHOULD_COPY -eq 1 ]]; then
+    log "[pipr] Mode decision: COPY ($DECISION_REASON)"
+  else
+    log "[pipr] Mode decision: ENCODE (reason: $DECISION_REASON)"
+  fi
+fi
 
 #########################################
 # Optional: Propagate HTTP headers      #
@@ -438,28 +708,9 @@ fi
 #########################################
 # Streaming with ffmpeg + error fallback#
 #########################################
-run_ffmpeg_copy() {
-  set +e
-  if [[ $VERBOSE -eq 1 ]]; then
-    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
-    else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
-    fi
-  else
-    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
-    else
-      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
-    fi
-  fi
-  local exit_code=$?
-  set -e
-  return $exit_code
-}
 
-run_ffmpeg_encode() {
-  set +e
+# Helper function to build encode command args
+build_encode_args() {
   local extra=()
   # Compatibility defaults for RTMP/FLV
   extra+=( -pix_fmt yuv420p -ac 2 )
@@ -531,6 +782,55 @@ run_ffmpeg_encode() {
       extra+=( -x264-params "scenecut=0" )
     fi
   fi
+  
+  echo "${extra[@]}"
+}
+
+# Dry-run mode: print planned commands and exit
+if [[ $DRY_RUN -eq 1 ]]; then
+  log "[pipr] DRY RUN MODE - Commands that would be executed:"
+  log ""
+  
+  # Show copy command
+  log "[pipr] Copy command (would be attempted first unless --force-encoding):"
+  echo "  ffmpeg ${FFMPEG_INPUT_ARGS[*]} -loglevel info -stats -c copy ${MAP_ARGS[*]} -f flv \"$MASKED_RTMP\""
+  log ""
+  
+  # Show encode command
+  local encode_extra
+  encode_extra=$(build_encode_args)
+  log "[pipr] Encode command (fallback or if forced):"
+  echo "  ffmpeg ${FFMPEG_INPUT_ARGS[*]} -loglevel info -stats ${MAP_ARGS[*]} -c:v $ENCODER -preset $PRESET -c:a aac $encode_extra -f flv \"$MASKED_RTMP\""
+  log ""
+  log "[pipr] Dry run complete. Exiting without streaming."
+  exit 0
+fi
+
+run_ffmpeg_copy() {
+  set +e
+  if [[ $VERBOSE -eq 1 ]]; then
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel info -stats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2> >(filter_stderr >&2)
+    fi
+  else
+    if [[ $ENABLE_LOGFILE -eq 1 ]]; then
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 1>>"$LOGFILE" 2> >(filter_stderr >>"$LOGFILE")
+    else
+      ffmpeg "${FFMPEG_INPUT_ARGS[@]}" -loglevel error -nostats -c copy "${MAP_ARGS[@]}" -f flv "$RTMP_ENDPOINT" 2>/dev/null
+    fi
+  fi
+  local exit_code=$?
+  set -e
+  return $exit_code
+}
+
+run_ffmpeg_encode() {
+  set +e
+  local encode_extra
+  encode_extra=$(build_encode_args)
+  read -ra extra <<< "$encode_extra"
 
   if [[ $VERBOSE -eq 1 ]]; then
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
@@ -557,9 +857,9 @@ if [[ $FORCE_ENCODING -eq 1 ]]; then
     exit 0
   else
     if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-      err "[pipr] ffmpeg failed with re-encoding. See $LOGFILE for details."
+      err "$EXIT_ENCODE_FAIL" "[pipr] ffmpeg failed with re-encoding. See $LOGFILE for details."
     else
-      err "[pipr] ffmpeg failed with re-encoding. Run with -v to see error details."
+      err "$EXIT_ENCODE_FAIL" "[pipr] ffmpeg failed with re-encoding. Run with -v to see error details."
     fi
   fi
 fi
@@ -570,13 +870,17 @@ if run_ffmpeg_copy; then
   exit 0
 fi
 
-log "[pipr] Codec copy failed. Retrying with re-encoding ($ENCODER/aac)..."
+# Copy failed, log fallback with exit code
+local copy_exit_code=$?
+log "[pipr] Fallback: copy failed (exit=$copy_exit_code), switching to encode."
+
+log "[pipr] Retrying with re-encoding ($ENCODER/aac)..."
 if run_ffmpeg_encode; then
   log "[pipr] Stream succeeded after re-encoding."
 else
   if [[ $ENABLE_LOGFILE -eq 1 ]]; then
-    err "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
+    err "$EXIT_ENCODE_FAIL" "[pipr] ffmpeg failed, even after re-encoding. See $LOGFILE for details."
   else
-    err "[pipr] ffmpeg failed, even after re-encoding. Run with -v to see error details."
+    err "$EXIT_ENCODE_FAIL" "[pipr] ffmpeg failed, even after re-encoding. Run with -v to see error details."
   fi
 fi

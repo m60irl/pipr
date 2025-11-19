@@ -8,10 +8,14 @@ It prefers stream copy first for lowest latency/CPU, with an automatic fallback 
 
 - Supports any site supported by yt-dlp (YouTube, Twitch, Kick, Odysee, YouNow, and hundreds more)
 - Auto-detects source domain and logs accordingly
+- **Preflight codec probing** (v0.2.0+): ffprobe analyzes media streams to determine optimal copy/encode strategy
+- **Smart copy/encode decision** (v0.2.0+): Automatically decides between copy and encode based on codec compatibility with RTMP
 - Extracts source via `yt-dlp` (`--get-url`), with multi-URL handling (separate A/V) and mapping
 - Streams to RTMP with `ffmpeg`
 - Copy-first strategy with automatic fallback to re-encoding
+- **Dry-run mode** (v0.2.0+): Test extraction and see planned commands without actually streaming
 - Re-encoding controls: encoder, bitrate, preset, audio bitrate/rate, keyframe interval (seconds or frames), GOP, optional FPS alignment
+- **Smarter default format selection** (v0.2.0+): Prefers H.264/AAC formats for better RTMP compatibility
 - Input resilience: reconnect flags for HTTP(S) sources with conditional `http_persistent` support (automatically detected)
 - Optional real-time pacing for VOD-to-RTMP streaming
 - Optional HTTP header propagation from yt-dlp to ffmpeg
@@ -19,6 +23,8 @@ It prefers stream copy first for lowest latency/CPU, with an automatic fallback 
 - Encoder-specific optimizations for libx264 and NVENC
 - Improved rate control for more predictable RTMP output
 - Robust logging with sanitizer: masks RTMP endpoints and reduces HTTP(S) URLs to `protocol://host/...`
+- **Log rotation** (v0.2.0+): Automatic log file rotation with configurable size limit
+- **Defined exit codes** (v0.2.0+): Specific exit codes for different failure scenarios
 - yt-dlp pass-through flags for cookies/headers/custom format selection
 - Preflight validation: tool version logging and rtmps protocol checking
 - Bash 3.2 compatibility (fallback for `mapfile`/`readarray` on older macOS)
@@ -101,15 +107,20 @@ pipr --ytdlp-arg "--add-header" --ytdlp-arg "Authorization: Bearer <TOKEN>" \
 # Prefer H.264/AAC where possible for higher chance of copy-first success
 pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
      "https://www.example.com/v" "rtmp://your-endpoint/live/stream_key"
+
+# Dry run to see what would be done (no actual streaming):
+pipr --dry-run -v "https://www.youtube.com/watch?v=XXXXX" "rtmp://your-endpoint/live/stream_key"
 ```
 
 ## Flags
 
 - General
-  - `-v`: Verbose mode; shows ffmpeg progress and mirrors yt-dlp/ffmpeg output to terminal (and log if file logging is enabled).
+  - `-v`, `--verbose`: Verbose mode; shows ffmpeg progress and mirrors yt-dlp/ffmpeg output to terminal (and log if file logging is enabled).
+  - `--dry-run`: Perform extraction and preflight probing, print planned mode and commands, then exit without streaming. Useful for debugging and planning.
   - `--force-encoding`: Skip stream copy and start with re-encoding.
   - `--realtime`: Apply real-time pacing (`-re`) to HTTP/HTTPS inputs for VOD-to-RTMP streaming.
   - `--propagate-headers`: Fetch and forward yt-dlp HTTP headers to ffmpeg. Requires `jq`. If `jq` is not available, a warning is logged and execution continues without header propagation.
+  - `--version`: Show version and exit.
 
 - Video encoding
   - `--encoder <name>`: Video encoder (default: `libx264`). Examples: `libx264`, `h264_nvenc`, `hevc_videotoolbox`.
@@ -131,19 +142,47 @@ pipr --ytdlp-format "bv*[vcodec*=avc1]+ba[acodec*=mp4a]/b[ext=mp4]" \
   - `--probesize <value>`: ffmpeg probesize (default: `100M`).
 
 - Logging
-  - `--log-file [<path>]`: Enable file logging. Optionally specify a log file path (default: `pipr.log` when enabled). File logging is OFF by default.
-  - `--no-log-file`: Explicitly disable file logging (default behavior). Terminal output still shows high-level pipr logs and (in `-v` mode) sanitized tool output.
+  - `--log [<path>]`: Enable file logging. Optionally specify a log file path (default: `pipr.log` when enabled). File logging is OFF by default.
+  - `--log-max-size <size>`: Maximum log size before rotation (e.g., `10M`, `50M`). When the log file exceeds this size, it's rotated and the last 3 logs are kept (`pipr.log`, `pipr.log.1`, `pipr.log.2`).
 
 - yt-dlp pass-through
-  - `--ytdlp-format <fmt>`: Override yt-dlp format selector (default: `bestvideo*+bestaudio/best`).
+  - `--ytdlp-format <fmt>`: Override yt-dlp format selector.
+    - Default (v0.2.0+): `bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4][vcodec^=avc1]/best`
+    - This default prefers H.264/AAC formats for better RTMP compatibility and copy-mode success.
   - `--ytdlp-arg <arg>`: Pass-through argument to yt-dlp. Repeatable.
     - Examples:
       - `--ytdlp-arg "--cookies cookies.txt"`
       - `--ytdlp-arg "--add-header" --ytdlp-arg "Authorization: Bearer <TOKEN>"`
 
 Notes on precedence
-- Copy-first: Without `--force-encoding`, the tool tries `-c copy` first. If copy fails, it re-encodes using your flags.
+- Copy-first: Without `--force-encoding` or `--dry-run`, the tool tries `-c copy` first. If copy fails, it re-encodes using your flags.
 - If both `--keyframe-interval` and `--gop` are provided, `--keyframe-interval` takes precedence.
+- Preflight probing (v0.2.0+): Before streaming, pipr probes the media to determine if copy or encode is required based on codec compatibility.
+
+## Exit Codes
+
+pipr uses specific exit codes to help with automation and error handling:
+
+- `0`: Success
+- `2`: Invalid arguments or usage error
+- `10`: yt-dlp failed to extract stream URL
+- `11`: No media URLs returned by yt-dlp
+- `20`: Stream copy failed (only returned if encode fallback is disabled or also fails)
+- `21`: Encoding failed
+- `22`: ffprobe failed (currently unused, reserved for future use)
+
+Example usage in scripts:
+```bash
+#!/bin/bash
+pipr "https://..." "rtmp://..."
+exit_code=$?
+case $exit_code in
+  0) echo "Stream succeeded" ;;
+  10|11) echo "Media extraction failed" ;;
+  20|21) echo "Streaming/encoding failed" ;;
+  *) echo "Unknown error: $exit_code" ;;
+esac
+```
 
 ## Production defaults
 
