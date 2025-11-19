@@ -28,6 +28,16 @@ err() {
   exit 1
 }
 
+#########################
+# Bash Version Detection #
+#########################
+BASH_LT4=0
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  # shellcheck disable=SC2034  # BASH_LT4 is intentionally informational
+  BASH_LT4=1
+  log "[pipr] Warning: running on Bash ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} (<4). Using compatibility path for URL collection. Consider installing newer Bash."
+fi
+
 ###################
 # Error & Signal Handling #
 ###################
@@ -216,9 +226,25 @@ log "[pipr] Buffering: analyzeduration=$ANALYZEDURATION probesize=$PROBESIZE"
 #######################
 log "[pipr] Getting media stream URL from yt-dlp for: $DOMAIN"
 if [[ $VERBOSE -eq 1 ]]; then
-  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+  if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
+    mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+  else
+    # Bash 3.2 fallback: use while read loop with process substitution
+    MEDIA_URLS=()
+    while IFS= read -r line; do
+      MEDIA_URLS+=("$line")
+    done < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr | tee -a "$LOGFILE" >&2)) || err "[pipr] yt-dlp failed to get stream URL"
+  fi
 else
-  mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+  if command -v mapfile &>/dev/null || command -v readarray &>/dev/null; then
+    mapfile -t MEDIA_URLS < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+  else
+    # Bash 3.2 fallback: use while read loop with process substitution
+    MEDIA_URLS=()
+    while IFS= read -r line; do
+      MEDIA_URLS+=("$line")
+    done < <(yt-dlp --no-playlist "${YTDLP_ARGS[@]}" --get-url -f "$YTDLP_FORMAT" "$STREAM_URL" 2> >(filter_stderr >>"$LOGFILE")) || err "[pipr] yt-dlp failed to get stream URL"
+  fi
 fi
 
 if [[ ${#MEDIA_URLS[@]} -eq 0 ]]; then
